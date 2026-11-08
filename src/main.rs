@@ -86,12 +86,12 @@ fn build(operator: String, gtfs: PathBuf, out: PathBuf) -> Result<(), Box<dyn st
 
 async fn serve(bundles: PathBuf, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let shutdown = shutdown_signal()?;
     println!(
         "serving {} on http://{}",
         bundles.display(),
         listener.local_addr()?
     );
-    let shutdown = shutdown_signal()?;
     serve_http(
         listener,
         router(BundleStore::new(bundles)),
