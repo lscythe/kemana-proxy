@@ -48,7 +48,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      placeholder: Linux x86_64, Rust 1.99.0
+      placeholder: Linux x86_64, Rust 1.99.1
   - type: textarea
     id: logs
     attributes:

@@ -6,7 +6,7 @@ Thank you for contributing. Keep changes focused, tested and easy to review.
 
 1. Search existing issues and pull requests.
 2. For a new feature or an architectural change, open an issue first so the approach can be agreed.
-3. Run `mise install` and `hk install --mise` so the git hooks run locally.
+3. Run `mise install`. It installs every pinned tool, including the Rust toolchain, and enables the git hooks (`pre-commit`, `commit-msg` and `pre-push`). Hooks need mise's experimental flag, which `mise.toml` already sets.
 
 ## Branch flow
 
