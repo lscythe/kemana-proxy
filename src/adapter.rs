@@ -48,6 +48,8 @@ pub enum AdapterError {
          but the first and last stops of a trip need a time"
     )]
     UntimedTripEnd { file: &'static str, line: u64 },
+    #[error("{file}:{line}: arrival_time is later than departure_time")]
+    ArrivalAfterDeparture { file: &'static str, line: u64 },
     #[error(
         "{file}:{line}: arrival_time is before the departure_time on line {earlier_line}, \
          so the blank stops between them cannot be timed"

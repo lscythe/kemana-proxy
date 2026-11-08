@@ -349,6 +349,12 @@ impl GtfsScheduleAdapter {
         let arrival = optional_time(row, "arrival_time")?;
         let departure = optional_time(row, "departure_time")?;
         let timing = match (arrival, departure) {
+            (Some(arrival), Some(departure)) if arrival > departure => {
+                return Err(AdapterError::ArrivalAfterDeparture {
+                    file: STOP_TIMES,
+                    line: row.line(),
+                });
+            }
             (Some(arrival), Some(departure)) => Some(Timing { arrival, departure }),
             (Some(time), None) | (None, Some(time)) => Some(Timing {
                 arrival: time,
@@ -1297,6 +1303,94 @@ mod tests {
                     file: "stop_times.txt",
                     line: 4,
                     earlier_line: 2
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stop_time_arriving_after_it_departs_is_rejected_even_beside_a_blank_stop() {
+        let stops = "stop_id,stop_name,stop_lat,stop_lon\n\
+            A,Stop A,0,0\n\
+            B,Stop B,0,0\n\
+            C,Stop C,0,4\n";
+        let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+            T1,08:10:00,08:00:00,A,1\n\
+            T1,,,B,2\n\
+            T1,08:30:00,08:30:00,C,3\n";
+        let error = Feed::minimal()
+            .with("stops.txt", stops)
+            .with("stop_times.txt", stop_times)
+            .load()
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AdapterError::ArrivalAfterDeparture {
+                    file: "stop_times.txt",
+                    line: 2
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stop_time_arriving_after_it_departs_is_rejected_past_twenty_four_hours() {
+        let stop_times = |arrival: &str, departure: &str| {
+            format!(
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                 T1,{arrival},{departure},S1,1\n\
+                 T1,26:00:00,26:00:00,S2,2\n"
+            )
+        };
+
+        let error = Feed::minimal()
+            .with("stop_times.txt", &stop_times("25:10:00", "25:00:00"))
+            .load()
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AdapterError::ArrivalAfterDeparture {
+                    file: "stop_times.txt",
+                    line: 2
+                }
+            ),
+            "{error}"
+        );
+
+        Feed::minimal()
+            .with("stop_times.txt", &stop_times("25:00:00", "25:00:00"))
+            .load()
+            .unwrap();
+    }
+
+    #[test]
+    fn backwards_anchors_report_their_true_lines_when_rows_are_out_of_order() {
+        let stops = "stop_id,stop_name,stop_lat,stop_lon\n\
+            A,Stop A,0,0\n\
+            B,Stop B,0,1\n\
+            C,Stop C,0,4\n";
+        let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+            T1,08:00:00,08:00:00,C,3\n\
+            T1,,,B,2\n\
+            T1,08:10:00,08:10:00,A,1\n";
+        let error = Feed::minimal()
+            .with("stops.txt", stops)
+            .with("stop_times.txt", stop_times)
+            .load()
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AdapterError::BackwardsTimes {
+                    file: "stop_times.txt",
+                    line: 2,
+                    earlier_line: 4
                 }
             ),
             "{error}"
