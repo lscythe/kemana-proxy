@@ -33,6 +33,18 @@ Bundles are streamed from disk with a `Content-Length`. `HEAD` returns the same 
 
 A bundle's bytes never change for a version, so clients can keep it forever and only revalidate the manifest. Both routes answer a matching `If-None-Match` (a list, `*`, or a `W/` tag) with `304 Not Modified` and no body. A missing file is still 404, even with `If-None-Match`.
 
+### Resuming a download
+
+Bundle responses carry `Accept-Ranges: bytes`, so a client can resume an interrupted download. `GET` with a single `Range` header (`bytes=a-b`, `bytes=a-` or `bytes=-n`) returns `206 Partial Content` with a `Content-Range`, streamed from disk starting at the offset. An end past the last byte is clamped.
+
+- A start at or past the end of the bundle (or `bytes=-0`) returns `416` with `Content-Range: bytes */<length>`.
+- Several ranges, another unit, or a malformed or reversed range are ignored and the full bundle is returned with `200`.
+- `If-Range` is honoured only when it is exactly the bundle's quoted `ETag`. A weak tag, a different tag or a date returns the full bundle, so a client holding a stale partial file restarts.
+- A matching `If-None-Match` is answered with `304` before `Range` is considered. A missing bundle is still 404.
+- `HEAD` and the manifest ignore `Range`.
+
+To check a resumed file, compare the sha256 of the joined parts with the manifest.
+
 `serve` stops on ctrl-c or SIGTERM. Requests in flight get up to 30 seconds to finish, then the process exits regardless, so a slow client cannot block a deploy.
 
 ## Requirements

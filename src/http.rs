@@ -1,20 +1,24 @@
 use std::future::{self, IntoFuture};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::io::ReaderStream;
 
 use crate::bundle::BundleStore;
+use range::RangeRequest;
+
+mod range;
 
 /// How long `serve` waits for in-flight requests after a shutdown signal.
 pub const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(30);
@@ -24,6 +28,7 @@ const ZSTD: &str = "application/zstd";
 // A bundle's bytes never change for a given version, so clients may keep it forever.
 const BUNDLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const MANIFEST_CACHE_CONTROL: &str = "no-cache";
+const BYTE_RANGES: &str = "bytes";
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 pub fn router(store: BundleStore) -> Router {
@@ -80,15 +85,17 @@ async fn manifest(State(store): State<BundleStore>, request_headers: HeaderMap) 
     )
 }
 
+/// Checks run in the order RFC 9110 gives: existence, `If-None-Match`, then `Range`.
 async fn bundle(
     State(store): State<BundleStore>,
     UrlPath(version): UrlPath<String>,
+    method: Method,
     request_headers: HeaderMap,
 ) -> Response {
     let Some(path) = store.bundle_path(&version) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let file = match tokio::fs::File::open(&path).await {
+    let mut file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(error) => return read_failure(&path, &error),
     };
@@ -100,8 +107,89 @@ async fn bundle(
     if matches_if_none_match(&request_headers, &etag) {
         return not_modified(&etag, BUNDLE_CACHE_CONTROL);
     }
-    let body = Body::from_stream(ReaderStream::with_capacity(file, STREAM_CHUNK_BYTES));
-    ok(ZSTD, &etag, BUNDLE_CACHE_CONTROL, length, body)
+    let requested = if method == Method::GET {
+        requested_range(&request_headers, &etag, length)
+    } else {
+        RangeRequest::Ignore
+    };
+    match requested {
+        RangeRequest::Ignore => {
+            let body = Body::from_stream(ReaderStream::with_capacity(file, STREAM_CHUNK_BYTES));
+            bundle_response(StatusCode::OK, &etag, length, None, body)
+        }
+        RangeRequest::Unsatisfiable => range_not_satisfiable(length),
+        RangeRequest::Satisfiable(span) => {
+            if let Err(error) = file.seek(SeekFrom::Start(span.first)).await {
+                return read_failure(&path, &error);
+            }
+            let body = Body::from_stream(ReaderStream::with_capacity(
+                file.take(span.len()),
+                STREAM_CHUNK_BYTES,
+            ));
+            let content_range = format!("bytes {}-{}/{length}", span.first, span.last);
+            bundle_response(
+                StatusCode::PARTIAL_CONTENT,
+                &etag,
+                span.len(),
+                Some(&content_range),
+                body,
+            )
+        }
+    }
+}
+
+fn requested_range(request_headers: &HeaderMap, etag: &str, length: u64) -> RangeRequest {
+    let Some(header) = request_headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return RangeRequest::Ignore;
+    };
+    if !if_range_allows_range(request_headers, etag) {
+        return RangeRequest::Ignore;
+    }
+    range::parse(header, length)
+}
+
+/// `If-Range` needs a strong comparison, so a weak tag or an HTTP date, which
+/// this server never issues, cannot match and the client restarts from byte 0.
+fn if_range_allows_range(request_headers: &HeaderMap, etag: &str) -> bool {
+    request_headers
+        .get_all(header::IF_RANGE)
+        .iter()
+        .all(|value| value.to_str().is_ok_and(|candidate| candidate == etag))
+}
+
+fn bundle_response(
+    status: StatusCode,
+    etag: &str,
+    content_length: u64,
+    content_range: Option<&str>,
+    body: Body,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, ZSTD)
+        .header(header::CONTENT_LENGTH, content_length)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, BUNDLE_CACHE_CONTROL)
+        .header(header::ACCEPT_RANGES, BYTE_RANGES);
+    if let Some(content_range) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|error| internal_error(&error))
+}
+
+/// No `Cache-Control`: a client must not keep the error as if it were the bundle.
+fn range_not_satisfiable(length: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{length}"))
+        .header(header::ACCEPT_RANGES, BYTE_RANGES)
+        .body(Body::empty())
+        .unwrap_or_else(|error| internal_error(&error))
 }
 
 fn ok(
@@ -169,7 +257,10 @@ mod tests {
 
     use prost::Message;
     use reqwest::StatusCode;
-    use reqwest::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+    use reqwest::header::{
+        ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+        IF_NONE_MATCH,
+    };
     use sha2::{Digest, Sha256};
     use tokio::sync::Notify;
 
@@ -242,6 +333,22 @@ mod tests {
                 .send()
                 .await
                 .unwrap()
+        }
+
+        async fn get_with_headers(
+            &self,
+            path: &str,
+            headers: &[(&str, &str)],
+        ) -> reqwest::Response {
+            let mut request = Self::client().get(format!("{}{path}", self.base_url));
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            request.send().await.unwrap()
+        }
+
+        async fn get_range(&self, path: &str, range: &str) -> reqwest::Response {
+            self.get_with_headers(path, &[("range", range)]).await
         }
     }
 
@@ -453,6 +560,340 @@ mod tests {
         assert_eq!(response.headers()[CACHE_CONTROL], IMMUTABLE);
         assert_eq!(response.headers()[ETAG], BUNDLE_ETAG);
         assert!(response.bytes().await.unwrap().is_empty());
+    }
+
+    fn large_bundle() -> Vec<u8> {
+        (0..300_000_u32).map(|index| (index % 251) as u8).collect()
+    }
+
+    async fn assert_partial(response: reqwest::Response, first: usize, last: usize, bundle: &[u8]) {
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let expected = &bundle[first..=last];
+        assert_eq!(
+            response.headers()[CONTENT_RANGE],
+            format!("bytes {first}-{last}/{}", bundle.len()).as_str()
+        );
+        assert_eq!(
+            response.headers()[CONTENT_LENGTH],
+            expected.len().to_string().as_str()
+        );
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/zstd");
+        assert_eq!(response.headers()[ETAG], BUNDLE_ETAG);
+        assert_eq!(response.headers()[CACHE_CONTROL], IMMUTABLE);
+        assert_eq!(response.headers()[ACCEPT_RANGES], "bytes");
+        assert_eq!(response.bytes().await.unwrap(), expected);
+    }
+
+    async fn assert_full_bundle(response: reqwest::Response, bundle: &[u8]) {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(CONTENT_RANGE).is_none());
+        assert_eq!(response.headers()[ACCEPT_RANGES], "bytes");
+        assert_eq!(
+            response.headers()[CONTENT_LENGTH],
+            bundle.len().to_string().as_str()
+        );
+        assert_eq!(response.bytes().await.unwrap(), bundle);
+    }
+
+    async fn assert_unsatisfiable(response: reqwest::Response, length: usize) {
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers()[CONTENT_RANGE],
+            format!("bytes */{length}").as_str()
+        );
+        assert_eq!(response.headers()[ACCEPT_RANGES], "bytes");
+        assert!(response.headers().get(CACHE_CONTROL).is_none());
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_bundle_response_advertises_byte_ranges() {
+        let server = Server::start(true).await;
+
+        assert_full_bundle(server.get(&bundle_path()).await, BUNDLE_BYTES).await;
+        let head = server.head(&bundle_path()).await;
+        assert_eq!(head.headers()[ACCEPT_RANGES], "bytes");
+    }
+
+    #[tokio::test]
+    async fn a_middle_range_is_partial_content() {
+        let server = Server::start(true).await;
+
+        let response = server.get_range(&bundle_path(), "bytes=3-7").await;
+
+        assert_partial(response, 3, 7, BUNDLE_BYTES).await;
+        assert_eq!(&BUNDLE_BYTES[3..=7], b"press");
+    }
+
+    #[tokio::test]
+    async fn an_open_ended_range_runs_to_the_end_of_the_bundle() {
+        let server = Server::start(true).await;
+
+        let response = server.get_range(&bundle_path(), "bytes=11-").await;
+
+        assert_partial(response, 11, BUNDLE_BYTES.len() - 1, BUNDLE_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn a_suffix_range_selects_the_last_bytes_of_the_bundle() {
+        let server = Server::start(true).await;
+
+        let response = server.get_range(&bundle_path(), "bytes=-5").await;
+
+        assert_partial(
+            response,
+            BUNDLE_BYTES.len() - 5,
+            BUNDLE_BYTES.len() - 1,
+            BUNDLE_BYTES,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_first_and_last_bytes_can_be_requested_alone() {
+        let server = Server::start(true).await;
+        let last = BUNDLE_BYTES.len() - 1;
+
+        assert_partial(
+            server.get_range(&bundle_path(), "bytes=0-0").await,
+            0,
+            0,
+            BUNDLE_BYTES,
+        )
+        .await;
+        assert_partial(
+            server
+                .get_range(&bundle_path(), &format!("bytes={last}-{last}"))
+                .await,
+            last,
+            last,
+            BUNDLE_BYTES,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_end_past_the_bundle_is_clamped_to_its_last_byte() {
+        let server = Server::start(true).await;
+        let last = BUNDLE_BYTES.len() - 1;
+
+        let response = server.get_range(&bundle_path(), "bytes=20-9999").await;
+
+        assert_partial(response, 20, last, BUNDLE_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn a_suffix_longer_than_the_bundle_returns_all_of_it_as_partial_content() {
+        let server = Server::start(true).await;
+        let last = BUNDLE_BYTES.len() - 1;
+
+        let response = server.get_range(&bundle_path(), "bytes=-9999").await;
+
+        assert_partial(response, 0, last, BUNDLE_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn a_range_across_a_stream_chunk_boundary_is_byte_identical() {
+        let large = large_bundle();
+        let server = Server::start_with_bundle(&large).await;
+
+        for (header, first, last) in [
+            ("bytes=65530-131080", 65_530, 131_080),
+            ("bytes=65536-131071", 65_536, 131_071),
+            ("bytes=200000-", 200_000, large.len() - 1),
+            ("bytes=-100000", large.len() - 100_000, large.len() - 1),
+            ("bytes=0-299999", 0, large.len() - 1),
+        ] {
+            let response = server.get_range(&bundle_path(), header).await;
+            assert_partial(response, first, last, &large).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_range_past_the_end_of_the_bundle_is_not_satisfiable() {
+        let server = Server::start(true).await;
+        let length = BUNDLE_BYTES.len();
+
+        for header in [
+            format!("bytes={length}-"),
+            format!("bytes={length}-{length}"),
+            "bytes=100-200".to_owned(),
+            "bytes=-0".to_owned(),
+            "bytes=18446744073709551615-".to_owned(),
+        ] {
+            let response = server.get_range(&bundle_path(), &header).await;
+            assert_unsatisfiable(response, length).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn any_range_on_an_empty_bundle_is_not_satisfiable() {
+        let server = Server::start_with_bundle(b"").await;
+
+        for header in ["bytes=0-", "bytes=0-0", "bytes=-1"] {
+            let response = server.get_range(&bundle_path(), header).await;
+            assert_unsatisfiable(response, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_range_gets_the_full_bundle() {
+        let server = Server::start(true).await;
+
+        for header in [
+            "bytes=0-1,3-4",
+            "bytes=0-1,",
+            "items=0-1",
+            "bytes=",
+            "bytes=-",
+            "bytes=a-b",
+            "bytes=5-2",
+            "bytes=18446744073709551616-",
+            "bytes=0-18446744073709551616",
+            "garbage",
+        ] {
+            let response = server.get_range(&bundle_path(), header).await;
+            assert_full_bundle(response, BUNDLE_BYTES).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_if_range_matching_the_strong_tag_keeps_the_range() {
+        let server = Server::start(true).await;
+
+        let response = server
+            .get_with_headers(
+                &bundle_path(),
+                &[("range", "bytes=3-7"), ("if-range", BUNDLE_ETAG)],
+            )
+            .await;
+
+        assert_partial(response, 3, 7, BUNDLE_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn an_if_range_that_is_not_the_strong_tag_gets_the_full_bundle() {
+        let server = Server::start(true).await;
+
+        for validator in [
+            "\"1-fedcba9876543210\"".to_owned(),
+            format!("W/{BUNDLE_ETAG}"),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_owned(),
+            "1-0123456789abcdef".to_owned(),
+            String::new(),
+        ] {
+            let response = server
+                .get_with_headers(
+                    &bundle_path(),
+                    &[("range", "bytes=3-7"), ("if-range", &validator)],
+                )
+                .await;
+            assert_full_bundle(response, BUNDLE_BYTES).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_if_range_ignores_even_an_unsatisfiable_range() {
+        let server = Server::start(true).await;
+
+        let response = server
+            .get_with_headers(
+                &bundle_path(),
+                &[("range", "bytes=9999-"), ("if-range", "\"stale\"")],
+            )
+            .await;
+
+        assert_full_bundle(response, BUNDLE_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn a_matching_if_none_match_wins_over_a_range() {
+        let server = Server::start(true).await;
+
+        for range in ["bytes=3-7", "bytes=9999-", "bytes=0-1,3-4"] {
+            let response = server
+                .get_with_headers(
+                    &bundle_path(),
+                    &[("range", range), ("if-none-match", BUNDLE_ETAG)],
+                )
+                .await;
+            assert_not_modified(response, BUNDLE_ETAG, IMMUTABLE).await;
+        }
+        let with_if_range = server
+            .get_with_headers(
+                &bundle_path(),
+                &[
+                    ("range", "bytes=3-7"),
+                    ("if-range", BUNDLE_ETAG),
+                    ("if-none-match", "*"),
+                ],
+            )
+            .await;
+        assert_not_modified(with_if_range, BUNDLE_ETAG, IMMUTABLE).await;
+    }
+
+    #[tokio::test]
+    async fn a_different_if_none_match_still_honours_the_range() {
+        let server = Server::start(true).await;
+
+        let response = server
+            .get_with_headers(
+                &bundle_path(),
+                &[
+                    ("range", "bytes=3-7"),
+                    ("if-none-match", "\"1-fedcba9876543210\""),
+                ],
+            )
+            .await;
+
+        assert_partial(response, 3, 7, BUNDLE_BYTES).await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_bundle_is_not_found_even_with_a_range() {
+        let server = Server::start(false).await;
+
+        let response = server.get_range(&bundle_path(), "bytes=0-1").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn head_ignores_a_range() {
+        let server = Server::start(true).await;
+
+        for range in ["bytes=3-7", "bytes=9999-"] {
+            let response = Server::client()
+                .head(format!("{}{}", server.base_url, bundle_path()))
+                .header("range", range)
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get(CONTENT_RANGE).is_none());
+            assert_eq!(response.headers()[ACCEPT_RANGES], "bytes");
+            assert_eq!(
+                response.headers()[CONTENT_LENGTH],
+                BUNDLE_BYTES.len().to_string().as_str()
+            );
+            assert!(response.bytes().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_manifest_ignores_a_range() {
+        let server = Server::start(true).await;
+
+        let response = server.get_range("/v1/bundle/manifest", "bytes=0-3").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ACCEPT_RANGES).is_none());
+        assert!(response.headers().get(CONTENT_RANGE).is_none());
+        assert_eq!(
+            BundleManifest::decode(response.bytes().await.unwrap()).unwrap(),
+            manifest()
+        );
     }
 
     struct SlowRoute {

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use kemana_proxy::bundle::{BundleManifest, SCHEMA_VERSION};
 use prost::Message;
 use reqwest::StatusCode;
-use reqwest::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+use reqwest::header::{CACHE_CONTROL, CONTENT_RANGE, ETAG, IF_NONE_MATCH};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -65,6 +65,18 @@ impl RunningServer {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+        let mut request = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", self.base_url));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send().await.unwrap()
     }
 
     /// Uses the `kill` utility so the test needs no signal crate.
@@ -263,6 +275,75 @@ async fn a_client_downloads_the_bundle_built_from_a_gtfs_feed() {
         let status = server.terminate();
         assert!(status.success(), "the server exited with {status}");
     }
+}
+
+#[tokio::test]
+#[ignore = "end-to-end: builds the binary's bundle and serves it on localhost; run with `mise run e2e`"]
+async fn a_client_resumes_an_interrupted_download_with_a_range_request() {
+    let workspace = tempfile::tempdir().unwrap();
+    let gtfs = zip_fixture(workspace.path());
+    let bundles = workspace.path().join("bundles");
+    build_bundle(&gtfs, &bundles);
+    let server = RunningServer::start(&bundles);
+    let manifest = BundleManifest::decode(
+        server
+            .get("/v1/bundle/manifest")
+            .await
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let total = usize::try_from(manifest.size_bytes).unwrap();
+    let received = total / 3;
+    assert!(received > 0, "the demo bundle is too small to split");
+
+    let first_part = server
+        .get_with_headers(
+            &manifest.download_path,
+            &[("range", &format!("bytes=0-{}", received - 1))],
+        )
+        .await;
+    assert_eq!(first_part.status(), StatusCode::PARTIAL_CONTENT);
+    let etag = first_part.headers()[ETAG].to_str().unwrap().to_owned();
+    assert_eq!(etag, format!("\"{}\"", manifest.version));
+    assert_eq!(
+        first_part.headers()[CONTENT_RANGE],
+        format!("bytes 0-{}/{total}", received - 1).as_str()
+    );
+    let mut downloaded = first_part.bytes().await.unwrap().to_vec();
+    assert_eq!(downloaded.len(), received);
+
+    let remainder = server
+        .get_with_headers(
+            &manifest.download_path,
+            &[
+                ("range", &format!("bytes={}-", downloaded.len())),
+                ("if-range", &etag),
+            ],
+        )
+        .await;
+    assert_eq!(remainder.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        remainder.headers()[CONTENT_RANGE],
+        format!("bytes {received}-{}/{total}", total - 1).as_str()
+    );
+    downloaded.extend_from_slice(&remainder.bytes().await.unwrap());
+
+    assert_eq!(downloaded.len() as u64, manifest.size_bytes);
+    assert_eq!(sha256_hex(&downloaded), manifest.sha256);
+
+    let past_the_end = server
+        .get_with_headers(
+            &manifest.download_path,
+            &[("range", &format!("bytes={total}-"))],
+        )
+        .await;
+    assert_eq!(past_the_end.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        past_the_end.headers()[CONTENT_RANGE],
+        format!("bytes */{total}").as_str()
+    );
 }
 
 fn assert_service_calendars_reached_the_bundle(connection: &Connection) {
