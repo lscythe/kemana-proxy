@@ -20,6 +20,7 @@ description = "Run the static checks"
 run = [
   "cargo fmt --check",
   "cargo clippy --all-targets -- -D warnings",
+  "hk check --all",
 ]
 
 [tasks.test]
