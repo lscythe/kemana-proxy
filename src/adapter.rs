@@ -56,4 +56,17 @@ pub enum AdapterError {
         value: String,
         target: &'static str,
     },
+    #[error("{file}:{line}: duplicate key ({}) = {value:?}", key_fields.join(", "))]
+    DuplicateKey {
+        file: &'static str,
+        line: u64,
+        key_fields: &'static [&'static str],
+        value: String,
+    },
+    #[error("{file}:{line}: stop {stop_id:?} is its own ancestor through parent_station")]
+    ParentCycle {
+        file: &'static str,
+        line: u64,
+        stop_id: String,
+    },
 }

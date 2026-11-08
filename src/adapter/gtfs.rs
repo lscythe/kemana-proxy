@@ -1,7 +1,8 @@
 mod table;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::hash::Hash;
 use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
@@ -54,30 +55,68 @@ impl GtfsScheduleAdapter {
         let stop_ids = ids(&stops, |stop| &stop.id);
         let routes = required(
             ROUTES,
-            parse_file(&mut archive, ROUTES, |row| self.route(row))?,
+            parse_unique(
+                &mut archive,
+                ROUTES,
+                &["route_id"],
+                |route: &Route| route.id.clone(),
+                |row| self.route(row),
+            )?,
         )?;
         let route_ids = ids(&routes, |route| &route.id);
         let trips = required(
             TRIPS,
-            parse_file(&mut archive, TRIPS, |row| self.trip(row, &route_ids))?,
+            parse_unique(
+                &mut archive,
+                TRIPS,
+                &["trip_id"],
+                |trip: &Trip| trip.id.clone(),
+                |row| self.trip(row, &route_ids),
+            )?,
         )?;
         let trip_ids = ids(&trips, |trip| &trip.id);
         let stop_times = required(
             STOP_TIMES,
-            parse_file(&mut archive, STOP_TIMES, |row| {
-                self.stop_time(row, &trip_ids, &stop_ids)
-            })?,
+            parse_unique(
+                &mut archive,
+                STOP_TIMES,
+                &["trip_id", "stop_sequence"],
+                |stop_time: &StopTime| (stop_time.trip_id.clone(), stop_time.stop_sequence),
+                |row| self.stop_time(row, &trip_ids, &stop_ids),
+            )?,
         )?;
-        let shapes =
-            parse_file(&mut archive, SHAPES, |row| self.shape_point(row))?.unwrap_or_default();
-        let frequencies = parse_file(&mut archive, FREQUENCIES, |row| {
-            self.frequency(row, &trip_ids)
-        })?
+        let shapes = parse_unique(
+            &mut archive,
+            SHAPES,
+            &["shape_id", "shape_pt_sequence"],
+            |point: &ShapePoint| (point.shape_id.clone(), point.sequence),
+            |row| self.shape_point(row),
+        )?
         .unwrap_or_default();
-        let fares =
-            parse_file(&mut archive, FARE_ATTRIBUTES, |row| self.fare(row))?.unwrap_or_default();
-        let transfers = parse_file(&mut archive, TRANSFERS, |row| self.transfer(row, &stop_ids))?
-            .unwrap_or_default();
+        let frequencies = parse_unique(
+            &mut archive,
+            FREQUENCIES,
+            &["trip_id", "start_time"],
+            |frequency: &Frequency| (frequency.trip_id.clone(), frequency.start),
+            |row| self.frequency(row, &trip_ids),
+        )?
+        .unwrap_or_default();
+        let fares = parse_unique(
+            &mut archive,
+            FARE_ATTRIBUTES,
+            &["fare_id"],
+            |fare: &Fare| fare.id.clone(),
+            |row| self.fare(row),
+        )?
+        .unwrap_or_default();
+        let transfers = parse_unique(
+            &mut archive,
+            TRANSFERS,
+            &["from_stop_id", "to_stop_id"],
+            |transfer: &Transfer| (transfer.from_stop_id.clone(), transfer.to_stop_id.clone()),
+            |row| self.transfer(row, &stop_ids),
+        )?
+        .unwrap_or_default();
 
         Ok(Dataset {
             operator,
@@ -124,31 +163,48 @@ impl GtfsScheduleAdapter {
         &self,
         archive: &mut ZipArchive<R>,
     ) -> Result<Vec<Stop>, AdapterError> {
-        let mut parents = Vec::new();
+        let mut links = Vec::new();
         let stops = required(
             STOPS,
-            parse_file(archive, STOPS, |row| {
-                let stop = self.stop(row)?;
-                if let Some(parent) = row.optional("parent_station") {
-                    parents.push((row.line(), parent.to_owned()));
-                }
-                Ok(stop)
-            })?,
+            parse_unique(
+                archive,
+                STOPS,
+                &["stop_id"],
+                |stop: &Stop| stop.id.clone(),
+                |row| {
+                    let stop = self.stop(row)?;
+                    if let Some(parent) = row.optional("parent_station") {
+                        links.push(ParentLink {
+                            line: row.line(),
+                            stop: row.required("stop_id")?.to_owned(),
+                            parent: parent.to_owned(),
+                        });
+                    }
+                    Ok(stop)
+                },
+            )?,
         )?;
         let stop_ids = ids(&stops, |stop| &stop.id);
-        match parents
-            .into_iter()
-            .find(|(_, parent)| !stop_ids.contains(&self.id(parent)))
+        if let Some(link) = links
+            .iter()
+            .find(|link| !stop_ids.contains(&self.id(&link.parent)))
         {
-            Some((line, parent)) => Err(AdapterError::UnknownReference {
+            return Err(AdapterError::UnknownReference {
                 file: STOPS,
-                line,
+                line: link.line,
                 field: "parent_station",
-                value: parent,
+                value: link.parent.clone(),
                 target: STOPS,
-            }),
-            None => Ok(stops),
+            });
         }
+        if let Some(link) = find_parent_cycle(&links) {
+            return Err(AdapterError::ParentCycle {
+                file: STOPS,
+                line: link.line,
+                stop_id: link.stop.clone(),
+            });
+        }
+        Ok(stops)
     }
 
     fn stop(&self, row: &Row) -> Result<Stop, AdapterError> {
@@ -293,6 +349,58 @@ fn parse_file<R: Read + Seek, T>(
         Err(ZipError::FileNotFound) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Keys compare by parsed value, as the database does, so `1` and `01` in a
+/// sequence column are the same key.
+fn parse_unique<R: Read + Seek, T, K: Eq + Hash>(
+    archive: &mut ZipArchive<R>,
+    file: &'static str,
+    key_fields: &'static [&'static str],
+    key: impl Fn(&T) -> K,
+    mut parse: impl FnMut(&Row) -> Result<T, AdapterError>,
+) -> Result<Option<Vec<T>>, AdapterError> {
+    let mut seen = HashSet::new();
+    parse_file(archive, file, |row| {
+        let item = parse(row)?;
+        if seen.insert(key(&item)) {
+            Ok(item)
+        } else {
+            Err(row.duplicate(key_fields))
+        }
+    })
+}
+
+struct ParentLink {
+    line: u64,
+    stop: String,
+    parent: String,
+}
+
+/// Returns the link at which a walk up the parents first revisits a stop, so
+/// the reported stop is inside the cycle rather than merely leading into it.
+fn find_parent_cycle(links: &[ParentLink]) -> Option<&ParentLink> {
+    let by_stop: HashMap<&str, &ParentLink> = links
+        .iter()
+        .map(|link| (link.stop.as_str(), link))
+        .collect();
+    let mut cleared = HashSet::new();
+    for link in links {
+        let mut path = HashSet::new();
+        let mut current = Some(link);
+        while let Some(step) = current {
+            let stop = step.stop.as_str();
+            if cleared.contains(stop) {
+                break;
+            }
+            if !path.insert(stop) {
+                return Some(step);
+            }
+            current = by_stop.get(step.parent.as_str()).copied();
+        }
+        cleared.extend(path);
+    }
+    None
 }
 
 fn required<T>(file: &'static str, rows: Option<Vec<T>>) -> Result<Vec<T>, AdapterError> {
@@ -684,6 +792,155 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_repeated_primary_key_reports_file_line_and_key() {
+        let cases: [(&'static str, &str, u64, &[&str], &str); 8] = [
+            (
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon\nS1,A,1,2\nS2,B,1,2\nS1,C,1,2\n",
+                4,
+                &["stop_id"],
+                "S1",
+            ),
+            (
+                "routes.txt",
+                "route_id,route_type\nR1,3\nR1,3\n",
+                3,
+                &["route_id"],
+                "R1",
+            ),
+            (
+                "trips.txt",
+                "route_id,service_id,trip_id\nR1,WK,T1\nR1,WK,T1\n",
+                3,
+                &["trip_id"],
+                "T1",
+            ),
+            (
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+                 T1,08:00:00,08:00:00,S1,1\n\
+                 T1,08:10:00,08:10:00,S2,01\n",
+                3,
+                &["trip_id", "stop_sequence"],
+                "T1, 01",
+            ),
+            (
+                "shapes.txt",
+                "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\nSH1,1,2,0\nSH1,1,2,0\n",
+                3,
+                &["shape_id", "shape_pt_sequence"],
+                "SH1, 0",
+            ),
+            (
+                "frequencies.txt",
+                "trip_id,start_time,end_time,headway_secs\n\
+                 T1,06:00:00,07:00:00,600\n\
+                 T1,6:00:00,08:00:00,300\n",
+                3,
+                &["trip_id", "start_time"],
+                "T1, 6:00:00",
+            ),
+            (
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method,transfers\nF1,1,USD,0,\nF1,2,USD,0,\n",
+                3,
+                &["fare_id"],
+                "F1",
+            ),
+            (
+                "transfers.txt",
+                "from_stop_id,to_stop_id\nS1,S2\nS2,S1\nS1,S2\n",
+                4,
+                &["from_stop_id", "to_stop_id"],
+                "S1, S2",
+            ),
+        ];
+
+        for (file, contents, expected_line, expected_fields, expected_value) in cases {
+            let error = Feed::minimal().with(file, contents).load().unwrap_err();
+
+            match &error {
+                AdapterError::DuplicateKey {
+                    file: reported,
+                    line,
+                    key_fields,
+                    value,
+                } => {
+                    assert_eq!(*reported, file);
+                    assert_eq!(*line, expected_line, "{file}");
+                    assert_eq!(*key_fields, expected_fields, "{file}");
+                    assert_eq!(value, expected_value, "{file}");
+                }
+                other => panic!("{file}: expected a duplicate key, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_composite_key_only_repeats_when_every_part_matches() {
+        let trips = "route_id,service_id,trip_id\nR1,WK,T1\nR1,WK,T2\n";
+        let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+            T1,08:00:00,08:00:00,S1,1\n\
+            T2,08:00:00,08:00:00,S1,1\n";
+        let dataset = Feed::minimal()
+            .with("trips.txt", trips)
+            .with("stop_times.txt", stop_times)
+            .load()
+            .unwrap();
+
+        assert_eq!(dataset.stop_times.len(), 2);
+    }
+
+    fn assert_parent_cycle(stops: &str, expected_line: u64, expected_stop: &str) {
+        let error = Feed::minimal().with("stops.txt", stops).load().unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AdapterError::ParentCycle { file: "stops.txt", line, stop_id }
+                    if *line == expected_line && stop_id == expected_stop
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_is_its_own_parent_is_rejected() {
+        assert_parent_cycle(
+            "stop_id,stop_name,stop_lat,stop_lon,parent_station\n\
+             S1,Platform,1.5,103.5,\n\
+             S2,Riverside,1.6,103.6,S2\n",
+            3,
+            "S2",
+        );
+    }
+
+    #[test]
+    fn a_parent_cycle_is_rejected_at_a_stop_inside_the_cycle() {
+        assert_parent_cycle(
+            "stop_id,stop_name,stop_lat,stop_lon,parent_station\n\
+             LEAF,Leaf,1.5,103.5,A\n\
+             A,Stop A,1.5,103.5,B\n\
+             B,Stop B,1.5,103.5,C\n\
+             C,Stop C,1.5,103.5,A\n",
+            3,
+            "A",
+        );
+    }
+
+    #[test]
+    fn a_boarding_area_may_have_a_platform_parent_listed_after_it() {
+        let stops = "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n\
+            BOARD,Boarding Area,1.5,103.5,4,S1\n\
+            S1,Platform,1.5,103.5,0,STN\n\
+            STN,Central,1.5,103.5,1,\n\
+            S2,Riverside,1.6,103.6,0,\n";
+        let dataset = Feed::minimal().with("stops.txt", stops).load().unwrap();
+
+        assert_eq!(dataset.stops[0].parent_station, Some(id("S1")));
     }
 
     #[test]

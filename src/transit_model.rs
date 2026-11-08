@@ -21,7 +21,7 @@ impl fmt::Display for EntityId {
 
 /// Seconds since the start of the service day. Trips that run past midnight
 /// keep counting, so values above 86400 are valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServiceTime(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

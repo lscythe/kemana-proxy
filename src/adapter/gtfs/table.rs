@@ -73,6 +73,19 @@ impl Row<'_> {
         }
     }
 
+    pub(super) fn duplicate(&self, key_fields: &'static [&'static str]) -> AdapterError {
+        let parts: Vec<&str> = key_fields
+            .iter()
+            .map(|field| self.optional(field).unwrap_or_default())
+            .collect();
+        AdapterError::DuplicateKey {
+            file: self.file,
+            line: self.line,
+            key_fields,
+            value: parts.join(", "),
+        }
+    }
+
     pub(super) fn reference(
         &self,
         field: &'static str,
