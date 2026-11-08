@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OpenFlags, Transaction, params};
 
 use crate::transit_model::{Dataset, EntityId, Stop};
 
@@ -39,6 +39,11 @@ pub fn write_sqlite(
     transaction.commit()?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(())
+}
+
+pub(super) fn read_operator_id(path: &Path) -> Result<String, BundleError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(connection.query_row("SELECT id FROM operators", [], |row| row.get(0))?)
 }
 
 fn insert_operator(transaction: &Transaction, dataset: &Dataset) -> rusqlite::Result<()> {

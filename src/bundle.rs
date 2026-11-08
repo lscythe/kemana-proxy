@@ -2,13 +2,14 @@ mod sqlite;
 mod store;
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use sqlite::read_operator_id;
 pub use sqlite::{SCHEMA_SQL, write_sqlite};
 pub use store::BundleStore;
 
@@ -25,6 +26,9 @@ const VERSION_DIGEST_LENGTH: usize = 16;
 /// encoding is worth it.
 const ZSTD_LEVEL: i32 = 19;
 
+#[cfg(unix)]
+const PUBLISHED_FILE_MODE: u32 = 0o644;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
     #[error(transparent)]
@@ -35,8 +39,17 @@ pub enum BundleError {
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot write the bundle database: {0}")]
+    #[error("bundle database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error(
+        "bundle {version} was built for operator {existing:?}, not {requested:?}; \
+         an output directory serves one operator"
+    )]
+    OperatorMismatch {
+        version: String,
+        existing: String,
+        requested: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +88,7 @@ pub fn build_bundle(
         .expect("a version built from a sha256 digest is well formed");
 
     let outcome = if bundle_path.exists() {
+        ensure_same_operator(adapter.operator_id(), &bundle_path, &version, out_dir)?;
         BuildOutcome::Unchanged
     } else {
         let dataset = adapter.load_static(source)?;
@@ -82,9 +96,7 @@ pub fn build_bundle(
         let database = NamedTempFile::new_in(out_dir).map_err(io_error(out_dir))?;
         write_sqlite(&dataset, &source_sha256, database.path())?;
         let compressed = compress(database.path(), out_dir)?;
-        compressed
-            .persist(&bundle_path)
-            .map_err(|error| io_error(&bundle_path)(error.error))?;
+        publish(compressed, &bundle_path)?;
         BuildOutcome::Built
     };
 
@@ -104,19 +116,53 @@ pub fn build_bundle(
 fn compress(database: &Path, out_dir: &Path) -> Result<NamedTempFile, BundleError> {
     let compressed = NamedTempFile::new_in(out_dir).map_err(io_error(out_dir))?;
     let input = File::open(database).map_err(io_error(database))?;
-    zstd::stream::copy_encode(
-        BufReader::new(input),
-        BufWriter::new(compressed.as_file()),
-        ZSTD_LEVEL,
-    )
-    .map_err(io_error(compressed.path()))?;
+    zstd::stream::copy_encode(BufReader::new(input), compressed.as_file(), ZSTD_LEVEL)
+        .map_err(io_error(compressed.path()))?;
     Ok(compressed)
+}
+
+/// The version only covers the source and schema, so the same feed built for
+/// another operator would otherwise pass as unchanged and keep the old ids.
+fn ensure_same_operator(
+    requested: &str,
+    bundle_path: &Path,
+    version: &str,
+    out_dir: &Path,
+) -> Result<(), BundleError> {
+    let database = NamedTempFile::new_in(out_dir).map_err(io_error(out_dir))?;
+    let input = File::open(bundle_path).map_err(io_error(bundle_path))?;
+    zstd::stream::copy_decode(BufReader::new(input), database.as_file())
+        .map_err(io_error(bundle_path))?;
+    let existing = read_operator_id(database.path())?;
+    if existing == requested {
+        Ok(())
+    } else {
+        Err(BundleError::OperatorMismatch {
+            version: version.to_owned(),
+            existing,
+            requested: requested.to_owned(),
+        })
+    }
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut file = NamedTempFile::new_in(dir).map_err(io_error(dir))?;
     file.write_all(bytes).map_err(io_error(file.path()))?;
+    publish(file, path)
+}
+
+/// Temp files start out private, but the server may run as another user than
+/// the build, so the permissions are set explicitly rather than left to the
+/// umask.
+fn publish(file: NamedTempFile, path: &Path) -> Result<(), BundleError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(PUBLISHED_FILE_MODE))
+            .map_err(io_error(file.path()))?;
+    }
     file.persist(path)
         .map_err(|error| io_error(path)(error.error))?;
     Ok(())
@@ -149,6 +195,7 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> BundleError + '_ {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Read;
 
     use prost::Message;
@@ -182,6 +229,18 @@ mod tests {
         }
     }
 
+    struct OtherOperatorAdapter;
+
+    impl OperatorAdapter for OtherOperatorAdapter {
+        fn operator_id(&self) -> &str {
+            "other"
+        }
+
+        fn load_static(&self, _source: &Path) -> Result<Dataset, AdapterError> {
+            Err(AdapterError::MissingFile { file: "stops.txt" })
+        }
+    }
+
     struct Workspace {
         dir: tempfile::TempDir,
     }
@@ -201,6 +260,16 @@ mod tests {
 
         fn out(&self) -> PathBuf {
             self.dir.path().join("bundles")
+        }
+
+        fn out_contents(&self) -> BTreeMap<String, Vec<u8>> {
+            self.out_entries()
+                .into_iter()
+                .map(|name| {
+                    let bytes = std::fs::read(self.out().join(&name)).unwrap();
+                    (name, bytes)
+                })
+                .collect()
         }
 
         fn out_entries(&self) -> Vec<String> {
@@ -345,6 +414,94 @@ mod tests {
             "{:?}",
             workspace.out_entries()
         );
+    }
+
+    #[test]
+    fn an_existing_bundle_built_for_another_operator_is_refused() {
+        let workspace = Workspace::new();
+        let source = workspace.source(b"feed");
+        let first = build_bundle(&sample_adapter(), &source, &workspace.out()).unwrap();
+        let before = workspace.out_contents();
+
+        let error = build_bundle(&OtherOperatorAdapter, &source, &workspace.out()).unwrap_err();
+
+        match error {
+            BundleError::OperatorMismatch {
+                version,
+                existing,
+                requested,
+            } => {
+                assert_eq!(version, first.manifest.version);
+                assert_eq!(existing, "demo");
+                assert_eq!(requested, "other");
+            }
+            other => panic!("expected an operator mismatch, got {other}"),
+        }
+        assert_eq!(workspace.out_contents(), before);
+    }
+
+    #[test]
+    fn a_rebuild_that_fails_to_load_keeps_the_previous_bundle_and_manifest() {
+        let workspace = Workspace::new();
+        build_bundle(
+            &sample_adapter(),
+            &workspace.source(b"old feed"),
+            &workspace.out(),
+        )
+        .unwrap();
+        let before = workspace.out_contents();
+
+        let error = build_bundle(
+            &FailingAdapter,
+            &workspace.source(b"new feed"),
+            &workspace.out(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, BundleError::Adapter(_)), "{error}");
+        assert_eq!(workspace.out_contents(), before);
+    }
+
+    #[test]
+    fn a_rebuild_that_fails_to_write_keeps_the_previous_bundle_and_manifest() {
+        let workspace = Workspace::new();
+        build_bundle(
+            &sample_adapter(),
+            &workspace.source(b"old feed"),
+            &workspace.out(),
+        )
+        .unwrap();
+        let before = workspace.out_contents();
+        let mut dangling = sqlite::tests::sample_dataset();
+        dangling.trips.clear();
+
+        let error = build_bundle(
+            &FixedAdapter(dangling),
+            &workspace.source(b"new feed"),
+            &workspace.out(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, BundleError::Sqlite(_)), "{error}");
+        assert_eq!(workspace.out_contents(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_files_can_be_read_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = Workspace::new();
+        let source = workspace.source(b"feed");
+        build_bundle(&sample_adapter(), &source, &workspace.out()).unwrap();
+
+        for name in workspace.out_entries() {
+            let mode = std::fs::metadata(workspace.out().join(&name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o644, "{name}");
+        }
     }
 
     #[test]

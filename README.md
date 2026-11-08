@@ -13,6 +13,8 @@ cargo run -- serve --bundles bundles --addr 127.0.0.1:8080
 
 The output directory holds one `<version>.sqlite.zst` per source feed and a `manifest.pb` for the latest build. The version is `<schema version>-<first 16 hex digits of the feed's sha256>`, so building an unchanged feed again is skipped.
 
+One output directory serves one operator: building a feed whose bundle already exists under a different `--operator` fails. The same source is never rebuilt unless its bundle file is deleted.
+
 | Endpoint | Response |
 | --- | --- |
 | `GET /v1/bundle/manifest` | `kemana.bundle.v1.BundleManifest` as protobuf; `sha256` and `size_bytes` describe the compressed download |
