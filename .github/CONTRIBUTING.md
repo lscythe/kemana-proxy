@@ -64,12 +64,7 @@ mise run check
 mise run test
 ```
 
-The `pre-push` hook runs both. On every pull request CI runs:
-
-- **Rust**: rustfmt check, clippy, the script tests, and `cargo llvm-cov` with the report uploaded to Codecov
-- **CodeQL** for Rust, and **Dependency review** for new dependencies
-
-The `Rust` job must pass before a pull request can merge. A pull request that only changes Markdown files or `docs/` skips it; the skipped job still satisfies the required check.
+The `pre-push` hook runs both. On every pull request CI runs the rustfmt check, clippy, the script tests, and `cargo llvm-cov` with the report uploaded to Codecov. CI must pass before a pull request is merged.
 
 ## Secrets
 
