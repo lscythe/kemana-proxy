@@ -1,0 +1,2 @@
+extension_id,note
+X1,non-standard files are ignored by the adapter
