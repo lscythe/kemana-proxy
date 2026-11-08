@@ -168,6 +168,7 @@ async fn a_client_downloads_the_bundle_built_from_a_gtfs_feed() {
     for (table, file) in [
         ("stops", "stops.txt"),
         ("routes", "routes.txt"),
+        ("service_exceptions", "calendar_dates.txt"),
         ("trips", "trips.txt"),
         ("stop_times", "stop_times.txt"),
         ("shapes", "shapes.txt"),
@@ -206,6 +207,77 @@ async fn a_client_downloads_the_bundle_built_from_a_gtfs_feed() {
         [
             ("demo:R1-PM".to_owned(), 62_250),
             ("demo:R2-NIGHT".to_owned(), 86_730)
+        ]
+    );
+
+    assert_service_calendars_reached_the_bundle(&connection);
+    assert_blank_stop_times_were_filled_in(&connection);
+}
+
+fn assert_service_calendars_reached_the_bundle(connection: &Connection) {
+    let services: i64 = single(connection, "SELECT count(*) FROM services");
+    assert_eq!(services, fixture_rows("calendar.txt") + 1);
+
+    let weekly: (u8, u8, u32, u32) = connection
+        .query_row(
+            "SELECT monday, sunday, start_date, end_date FROM services WHERE id = 'demo:WEEKDAY'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(weekly, (1, 0, 20_260_101, 20_261_231));
+
+    let exceptions_only: (u8, u8, Option<u32>, Option<u32>) = connection
+        .query_row(
+            "SELECT monday, sunday, start_date, end_date FROM services WHERE id = 'demo:EVENT'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(exceptions_only, (0, 0, None, None));
+
+    let exceptions: Vec<(String, u32, u8)> = connection
+        .prepare("SELECT service_id, date, exception_type FROM service_exceptions ORDER BY date")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        exceptions,
+        [
+            ("demo:WEEKDAY".to_owned(), 20_260_703, 2),
+            ("demo:WEEKDAY".to_owned(), 20_260_705, 1),
+            ("demo:EVENT".to_owned(), 20_260_815, 1),
+        ]
+    );
+
+    let event_trip_service: String = single(
+        connection,
+        "SELECT service_id FROM trips WHERE id = 'demo:R1-EVENT'",
+    );
+    assert_eq!(event_trip_service, "demo:EVENT");
+}
+
+fn assert_blank_stop_times_were_filled_in(connection: &Connection) {
+    let times: Vec<(u32, u32)> = connection
+        .prepare(
+            "SELECT arrival_time, departure_time FROM stop_times \
+             WHERE trip_id = 'demo:R1-EVENT' ORDER BY stop_sequence",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(
+        times,
+        [
+            (32_400, 32_400),
+            (32_996, 32_996),
+            (33_598, 33_598),
+            (34_200, 34_200),
         ]
     );
 }

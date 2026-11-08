@@ -25,6 +25,8 @@ pub fn write_sqlite(
     insert_operator(&transaction, dataset)?;
     insert_stops(&transaction, &dataset.stops)?;
     insert_routes(&transaction, dataset)?;
+    insert_services(&transaction, dataset)?;
+    insert_service_exceptions(&transaction, dataset)?;
     insert_trips(&transaction, dataset)?;
     insert_stop_times(&transaction, dataset)?;
     insert_shapes(&transaction, dataset)?;
@@ -110,6 +112,43 @@ fn insert_routes(transaction: &Transaction, dataset: &Dataset) -> rusqlite::Resu
             route.route_type,
             route.color,
             route.text_color,
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_services(transaction: &Transaction, dataset: &Dataset) -> rusqlite::Result<()> {
+    let mut statement = transaction.prepare(
+        "INSERT INTO services (id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    for service in &dataset.services {
+        let weekdays = service.weekdays;
+        statement.execute(params![
+            service.id.as_str(),
+            weekdays.monday,
+            weekdays.tuesday,
+            weekdays.wednesday,
+            weekdays.thursday,
+            weekdays.friday,
+            weekdays.saturday,
+            weekdays.sunday,
+            service.date_range.map(|range| range.start.yyyymmdd()),
+            service.date_range.map(|range| range.end.yyyymmdd()),
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_service_exceptions(transaction: &Transaction, dataset: &Dataset) -> rusqlite::Result<()> {
+    let mut statement = transaction.prepare(
+        "INSERT INTO service_exceptions (service_id, date, exception_type) VALUES (?1, ?2, ?3)",
+    )?;
+    for exception in &dataset.service_exceptions {
+        statement.execute(params![
+            exception.service_id.as_str(),
+            exception.date.yyyymmdd(),
+            exception.exception_type.code(),
         ])?;
     }
     Ok(())
@@ -227,8 +266,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::transit_model::{
-        EntityId, Fare, Frequency, Operator, Route, ServiceTime, ShapePoint, Stop, StopTime,
-        Transfer, Trip,
+        DateRange, EntityId, ExceptionType, Fare, Frequency, Operator, Route, Service, ServiceDate,
+        ServiceException, ServiceTime, ShapePoint, Stop, StopTime, Transfer, Trip, Weekdays,
     };
 
     const SOURCE_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -262,6 +301,10 @@ pub(crate) mod tests {
         }
     }
 
+    fn date(text: &str) -> ServiceDate {
+        ServiceDate::parse(text).unwrap()
+    }
+
     /// The platform is listed before its station on purpose, to prove the
     /// writer orders parents first.
     pub(crate) fn sample_dataset() -> Dataset {
@@ -282,6 +325,37 @@ pub(crate) mod tests {
                 color: None,
                 text_color: None,
             }],
+            services: vec![
+                Service {
+                    id: id("WK"),
+                    weekdays: Weekdays {
+                        monday: true,
+                        sunday: true,
+                        ..Weekdays::default()
+                    },
+                    date_range: Some(DateRange {
+                        start: date("20260101"),
+                        end: date("20261231"),
+                    }),
+                },
+                Service {
+                    id: id("EVENT"),
+                    weekdays: Weekdays::default(),
+                    date_range: None,
+                },
+            ],
+            service_exceptions: vec![
+                ServiceException {
+                    service_id: id("WK"),
+                    date: date("20260703"),
+                    exception_type: ExceptionType::Removed,
+                },
+                ServiceException {
+                    service_id: id("EVENT"),
+                    date: date("20260815"),
+                    exception_type: ExceptionType::Added,
+                },
+            ],
             trips: vec![Trip {
                 id: id("T1"),
                 route_id: id("R1"),
@@ -348,6 +422,11 @@ pub(crate) mod tests {
         assert_eq!(count(&connection, "operators"), 1);
         assert_eq!(count(&connection, "stops"), dataset.stops.len());
         assert_eq!(count(&connection, "routes"), dataset.routes.len());
+        assert_eq!(count(&connection, "services"), dataset.services.len());
+        assert_eq!(
+            count(&connection, "service_exceptions"),
+            dataset.service_exceptions.len()
+        );
         assert_eq!(count(&connection, "trips"), dataset.trips.len());
         assert_eq!(count(&connection, "stop_times"), dataset.stop_times.len());
         assert_eq!(count(&connection, "shapes"), dataset.shapes.len());
@@ -374,6 +453,100 @@ pub(crate) mod tests {
         assert_eq!(source, SOURCE_SHA256);
         assert_eq!(built_at.len(), "2026-01-01T00:00:00Z".len());
         assert!(built_at.ends_with('Z'), "{built_at}");
+    }
+
+    #[test]
+    fn user_version_and_bundle_meta_report_the_schema_version() {
+        let (_dir, connection) = written(&sample_dataset());
+
+        let user_version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let recorded: u32 = connection
+            .query_row("SELECT schema_version FROM bundle_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(user_version, SCHEMA_VERSION);
+        assert_eq!(recorded, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn weekly_services_store_their_weekdays_and_dates() {
+        let (_dir, connection) = written(&sample_dataset());
+
+        let row: (u8, u8, u8, u32, u32) = connection
+            .query_row(
+                "SELECT monday, tuesday, sunday, start_date, end_date FROM services \
+                 WHERE id = 'demo:WK'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row, (1, 0, 1, 20_260_101, 20_261_231));
+    }
+
+    #[test]
+    fn a_service_without_a_weekly_pattern_stores_null_dates() {
+        let (_dir, connection) = written(&sample_dataset());
+
+        let (monday, start, end): (u8, Option<u32>, Option<u32>) = connection
+            .query_row(
+                "SELECT monday, start_date, end_date FROM services WHERE id = 'demo:EVENT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!((monday, start, end), (0, None, None));
+    }
+
+    #[test]
+    fn service_exceptions_store_the_date_and_type_code() {
+        let (_dir, connection) = written(&sample_dataset());
+
+        let rows: Vec<(String, u32, u8)> = connection
+            .prepare(
+                "SELECT service_id, date, exception_type FROM service_exceptions ORDER BY date",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            [
+                ("demo:WK".to_owned(), 20_260_703, 2),
+                ("demo:EVENT".to_owned(), 20_260_815, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_trip_on_an_undefined_service_is_rejected_by_the_foreign_keys() {
+        let mut dataset = sample_dataset();
+        dataset.services.retain(|service| service.id != id("WK"));
+        dataset
+            .service_exceptions
+            .retain(|exception| exception.service_id != id("WK"));
+        let dir = tempfile::tempdir().unwrap();
+
+        let error =
+            write_sqlite(&dataset, SOURCE_SHA256, &dir.path().join("bundle.sqlite")).unwrap_err();
+
+        assert!(matches!(error, BundleError::Sqlite(_)), "{error}");
     }
 
     #[test]

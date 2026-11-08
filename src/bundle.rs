@@ -1,3 +1,6 @@
+#[cfg(test)]
+#[path = "../build_support/schema_version.rs"]
+mod schema_version;
 mod sqlite;
 mod store;
 
@@ -16,9 +19,9 @@ pub use store::BundleStore;
 use crate::adapter::{AdapterError, OperatorAdapter};
 pub use crate::proto::BundleManifest;
 
-/// Version of `contracts/bundle/schema.sql` this writer produces. Bump it
-/// whenever the pinned contracts change the schema.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The `PRAGMA user_version` of the pinned `contracts/bundle/schema.sql`,
+/// read at build time so it cannot drift from the schema this writer runs.
+pub const SCHEMA_VERSION: u32 = include!(concat!(env!("OUT_DIR"), "/bundle_schema_version.rs"));
 
 const VERSION_DIGEST_LENGTH: usize = 16;
 

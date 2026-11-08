@@ -5,7 +5,7 @@ use std::str::FromStr;
 use csv::{ReaderBuilder, StringRecord};
 
 use crate::adapter::AdapterError;
-use crate::transit_model::EntityId;
+use crate::transit_model::{EntityId, ServiceDate};
 
 const BYTE_ORDER_MARK: char = '\u{feff}';
 
@@ -86,6 +86,15 @@ impl Row<'_> {
         }
     }
 
+    pub(super) fn reversed_date_range(&self, start: ServiceDate, end: ServiceDate) -> AdapterError {
+        AdapterError::ReversedDateRange {
+            file: self.file,
+            line: self.line,
+            start,
+            end,
+        }
+    }
+
     pub(super) fn reference(
         &self,
         field: &'static str,
@@ -97,13 +106,22 @@ impl Row<'_> {
         if known.contains(id) {
             Ok(())
         } else {
-            Err(AdapterError::UnknownReference {
-                file: self.file,
-                line: self.line,
-                field,
-                value: source_id.to_owned(),
-                target,
-            })
+            Err(self.unknown_reference(field, source_id, target))
+        }
+    }
+
+    pub(super) fn unknown_reference(
+        &self,
+        field: &'static str,
+        source_id: &str,
+        target: &'static str,
+    ) -> AdapterError {
+        AdapterError::UnknownReference {
+            file: self.file,
+            line: self.line,
+            field,
+            value: source_id.to_owned(),
+            target,
         }
     }
 }
