@@ -43,7 +43,12 @@ impl RunningServer {
     }
 
     async fn get(&self, path: &str) -> reqwest::Response {
-        reqwest::get(format!("{}{path}", self.base_url))
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", self.base_url))
+            .send()
             .await
             .unwrap()
     }
