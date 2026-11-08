@@ -17,6 +17,8 @@ cargo run -- serve --bundles bundles --addr 127.0.0.1:8080
 
 The output directory holds one `<version>.sqlite.zst` per source feed and a `manifest.pb` for the latest build. The version is `<schema version>-<first 16 hex digits of the feed's sha256>`, so building an unchanged feed again is skipped.
 
+After each build, `--keep <count>` (default 3, minimum 1) caps how many `<version>.sqlite.zst` files stay in the directory, counting the one the manifest names, which is never removed. The rest are kept newest first by modification time and the older ones are deleted, and each removal is printed as `removed <version>`. A download already in progress keeps reading its open file, and a client resuming a deleted version gets a 404 and fetches the manifest again.
+
 One output directory serves one operator: building a feed whose bundle already exists under a different `--operator` fails. The same source is never rebuilt unless its bundle file is deleted.
 
 | Endpoint | Response |

@@ -30,6 +30,14 @@ impl BundleStore {
     }
 }
 
+/// The version a directory entry name stands for, or `None` for any name that
+/// is not exactly `<version>.sqlite.zst`.
+pub(super) fn version_of_file_name(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_suffix(BUNDLE_EXTENSION)
+        .filter(|version| is_bundle_version(version))
+}
+
 fn is_bundle_version(version: &str) -> bool {
     let Some((schema_version, digest)) = version.split_once('-') else {
         return false;
@@ -62,6 +70,24 @@ mod tests {
             store.bundle_path("1-0123456789abcdef"),
             Some(PathBuf::from("/srv/bundles/1-0123456789abcdef.sqlite.zst"))
         );
+    }
+
+    #[test]
+    fn only_an_exact_bundle_file_name_names_a_version() {
+        assert_eq!(
+            version_of_file_name("1-0123456789abcdef.sqlite.zst"),
+            Some("1-0123456789abcdef")
+        );
+        for name in [
+            "manifest.pb",
+            "1-0123456789abcdef",
+            "1-0123456789abcdef.sqlite.zst.bak",
+            "x1-0123456789abcdef.sqlite.zst",
+            ".sqlite.zst",
+            "bad.sqlite.zst",
+        ] {
+            assert_eq!(version_of_file_name(name), None, "{name:?}");
+        }
     }
 
     #[test]
