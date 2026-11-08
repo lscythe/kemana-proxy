@@ -1,0 +1,4 @@
+[submodule "contracts"]
+	path = contracts
+	url = https://github.com/lscythe/kemana-contracts.git
+	branch = develop

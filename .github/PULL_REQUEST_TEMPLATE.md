@@ -15,4 +15,5 @@
 - [ ] The title is a valid commit header, such as `feat(kemana-proxy): add stop endpoint`
 - [ ] Tests are added or updated
 - [ ] `mise run check` and `mise run test` pass
-- [ ] No secrets or personal data are included
+- [ ] No personal data is included
+- [ ] Naming is operator-neutral, and no secrets or tokens are included

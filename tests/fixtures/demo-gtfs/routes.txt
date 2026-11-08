@@ -1,0 +1,3 @@
+route_id,agency_id,route_short_name,route_long_name,route_type,route_color,route_text_color
+R1,DEMO,1,Central to Harbour,3,0055AA,FFFFFF
+R2,DEMO,N2,Night Loop,3,222222,FFFFFF

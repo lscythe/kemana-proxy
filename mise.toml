@@ -30,6 +30,10 @@ run = [
   "cargo test",
 ]
 
+[tasks.e2e]
+description = "Build a bundle from the demo feed, serve it and download it on localhost"
+run = "cargo test --test e2e -- --ignored"
+
 [tasks.build]
 description = "Build the release binary"
 run = "cargo build --release"

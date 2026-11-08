@@ -1,0 +1,5 @@
+shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,shape_dist_traveled
+SH-R1,10.000100,20.000100,0,0
+SH-R1,10.010000,20.010000,1,1550.5
+SH-R1,10.020000,20.020000,2,3101.0
+SH-R1,10.030000,20.030000,3,

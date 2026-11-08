@@ -1,0 +1,7 @@
+stop_id,stop_code,stop_name,stop_lat,stop_lon,location_type,parent_station,wheelchair_boarding
+CEN-P1,C1,Central Platform 1,10.000100,20.000100,0,CEN,1
+CEN-P2,C2,Central Platform 2,10.000200,20.000200,0,CEN,1
+CEN,,Central,10.000000,20.000000,1,,1
+MKT,M,Market,10.010000,20.010000,0,,2
+PRK,P,Park,10.020000,20.020000,0,,0
+HBR,H,Harbour,10.030000,20.030000,0,,
