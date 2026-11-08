@@ -106,13 +106,22 @@ impl Row<'_> {
         if known.contains(id) {
             Ok(())
         } else {
-            Err(AdapterError::UnknownReference {
-                file: self.file,
-                line: self.line,
-                field,
-                value: source_id.to_owned(),
-                target,
-            })
+            Err(self.unknown_reference(field, source_id, target))
+        }
+    }
+
+    pub(super) fn unknown_reference(
+        &self,
+        field: &'static str,
+        source_id: &str,
+        target: &'static str,
+    ) -> AdapterError {
+        AdapterError::UnknownReference {
+            file: self.file,
+            line: self.line,
+            field,
+            value: source_id.to_owned(),
+            target,
         }
     }
 }

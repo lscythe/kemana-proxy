@@ -6,6 +6,10 @@ A Rust service that normalizes upstream transit data (static schedules and real-
 
 `build-bundle` turns a GTFS Schedule zip into an offline SQLite bundle that follows `contracts/bundle/schema.sql`. Every id is namespaced as `<operator>:<source id>`, and times are seconds since the start of the service day (past 24 hours for trips after midnight). A malformed row fails the whole build with its file and line.
 
+Service calendars come from `calendar.txt` and `calendar_dates.txt`. Either may be absent, but a feed needs at least one. A service named only in `calendar_dates.txt` has no weekly pattern and runs only on the dates it adds.
+
+Blank intermediate stop times are interpolated by straight-line distance between stops, from the departure before them to the arrival after them. The first and last stops of a trip must have a time.
+
 ```sh
 cargo run -- build-bundle --operator demo --gtfs feed.zip --out bundles
 cargo run -- serve --bundles bundles --addr 127.0.0.1:8080

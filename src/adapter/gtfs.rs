@@ -1,3 +1,4 @@
+mod interpolation;
 mod table;
 
 use std::collections::{HashMap, HashSet};
@@ -9,12 +10,12 @@ use std::path::Path;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
+use self::interpolation::{GeoPoint, StopTimeRow, Timing, fill_blank_times};
 use self::table::{Row, parse_rows};
 use super::{AdapterError, OperatorAdapter};
 use crate::transit_model::{
     Dataset, DateRange, EntityId, ExceptionType, Fare, Frequency, Operator, Route, Service,
-    ServiceDate, ServiceException, ServiceTime, ShapePoint, Stop, StopTime, Transfer, Trip,
-    Weekdays,
+    ServiceDate, ServiceException, ServiceTime, ShapePoint, Stop, Transfer, Trip, Weekdays,
 };
 
 const AGENCY: &str = "agency.txt";
@@ -81,16 +82,17 @@ impl GtfsScheduleAdapter {
             )?,
         )?;
         let trip_ids = ids(&trips, |trip| &trip.id);
-        let stop_times = required(
+        let stop_positions = positions(&stops);
+        let stop_times = fill_blank_times(required(
             STOP_TIMES,
             parse_unique(
                 &mut archive,
                 STOP_TIMES,
                 &["trip_id", "stop_sequence"],
-                |stop_time: &StopTime| (stop_time.trip_id.clone(), stop_time.stop_sequence),
-                |row| self.stop_time(row, &trip_ids, &stop_ids),
+                |stop_time: &StopTimeRow| (stop_time.trip_id.clone(), stop_time.stop_sequence),
+                |row| self.stop_time(row, &trip_ids, &stop_positions),
             )?,
-        )?;
+        )?)?;
         let shapes = parse_unique(
             &mut archive,
             SHAPES,
@@ -336,33 +338,38 @@ impl GtfsScheduleAdapter {
         })
     }
 
-    /// GTFS lets either time be blank when the other is given; a row with
-    /// neither has no time to store.
+    /// GTFS lets either time be blank when the other is given. A row with
+    /// neither keeps no timing here and is filled in once its trip is known.
     fn stop_time(
         &self,
         row: &Row,
         trip_ids: &HashSet<EntityId>,
-        stop_ids: &HashSet<EntityId>,
-    ) -> Result<StopTime, AdapterError> {
+        stop_positions: &HashMap<EntityId, GeoPoint>,
+    ) -> Result<StopTimeRow, AdapterError> {
         let arrival = optional_time(row, "arrival_time")?;
         let departure = optional_time(row, "departure_time")?;
-        let (arrival, departure) = match (arrival, departure) {
-            (Some(arrival), Some(departure)) => (arrival, departure),
-            (Some(time), None) | (None, Some(time)) => (time, time),
-            (None, None) => {
-                return Err(AdapterError::MissingEveryField {
-                    file: STOP_TIMES,
-                    line: row.line(),
-                    fields: ["arrival_time", "departure_time"],
-                });
-            }
+        let timing = match (arrival, departure) {
+            (Some(arrival), Some(departure)) => Some(Timing { arrival, departure }),
+            (Some(time), None) | (None, Some(time)) => Some(Timing {
+                arrival: time,
+                departure: time,
+            }),
+            (None, None) => None,
         };
-        Ok(StopTime {
-            trip_id: self.reference(row, "trip_id", trip_ids, TRIPS)?,
-            stop_sequence: row.parse_required("stop_sequence")?,
-            stop_id: self.reference(row, "stop_id", stop_ids, STOPS)?,
-            arrival,
-            departure,
+        let trip_id = self.reference(row, "trip_id", trip_ids, TRIPS)?;
+        let stop_sequence = row.parse_required("stop_sequence")?;
+        let source_stop_id = row.required("stop_id")?;
+        let stop_id = self.id(source_stop_id);
+        let position = *stop_positions
+            .get(&stop_id)
+            .ok_or_else(|| row.unknown_reference("stop_id", source_stop_id, STOPS))?;
+        Ok(StopTimeRow {
+            line: row.line(),
+            trip_id,
+            stop_sequence,
+            stop_id,
+            position,
+            timing,
             pickup_type: row.parse_or("pickup_type", 0)?,
             drop_off_type: row.parse_or("drop_off_type", 0)?,
         })
@@ -497,6 +504,19 @@ fn required<T>(file: &'static str, rows: Option<Vec<T>>) -> Result<Vec<T>, Adapt
 
 fn ids<T>(items: &[T], id: impl Fn(&T) -> &EntityId) -> HashSet<EntityId> {
     items.iter().map(|item| id(item).clone()).collect()
+}
+
+fn positions(stops: &[Stop]) -> HashMap<EntityId, GeoPoint> {
+    stops
+        .iter()
+        .map(|stop| {
+            let position = GeoPoint {
+                lat: stop.lat,
+                lon: stop.lon,
+            };
+            (stop.id.clone(), position)
+        })
+        .collect()
 }
 
 fn coordinate(row: &Row, field: &'static str, limit: f64) -> Result<f64, AdapterError> {
@@ -1205,7 +1225,33 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_time_without_any_time_is_rejected() {
+    fn a_blank_intermediate_stop_time_is_placed_by_distance_along_the_trip() {
+        let stops = "stop_id,stop_name,stop_lat,stop_lon\n\
+            A,Stop A,0,0\n\
+            B,Stop B,0,1\n\
+            C,Stop C,0,4\n";
+        let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+            T1,08:00:00,08:00:00,A,1\n\
+            T1,,,B,2\n\
+            T1,08:10:00,08:10:00,C,3\n";
+        let dataset = Feed::minimal()
+            .with("stops.txt", stops)
+            .with("stop_times.txt", stop_times)
+            .load()
+            .unwrap();
+
+        assert_eq!(
+            dataset.stop_times[1].arrival,
+            ServiceTime::from_seconds(28_950)
+        );
+        assert_eq!(
+            dataset.stop_times[1].departure,
+            ServiceTime::from_seconds(28_950)
+        );
+    }
+
+    #[test]
+    fn a_trip_ending_on_a_stop_without_any_time_is_rejected() {
         let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
             T1,08:00:00,08:00:00,S1,1\n\
             T1,,,S2,2\n";
@@ -1217,16 +1263,44 @@ mod tests {
         assert!(
             matches!(
                 error,
-                AdapterError::MissingEveryField {
+                AdapterError::UntimedTripEnd {
                     file: "stop_times.txt",
-                    line: 3,
-                    fields: ["arrival_time", "departure_time"]
+                    line: 3
                 }
             ),
             "{error}"
         );
         assert!(error.to_string().contains("arrival_time"), "{error}");
         assert!(error.to_string().contains("departure_time"), "{error}");
+    }
+
+    #[test]
+    fn backwards_anchors_around_a_blank_stop_are_rejected_with_both_lines() {
+        let stops = "stop_id,stop_name,stop_lat,stop_lon\n\
+            A,Stop A,0,0\n\
+            B,Stop B,0,1\n\
+            C,Stop C,0,4\n";
+        let stop_times = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n\
+            T1,08:10:00,08:10:00,A,1\n\
+            T1,,,B,2\n\
+            T1,08:00:00,08:00:00,C,3\n";
+        let error = Feed::minimal()
+            .with("stops.txt", stops)
+            .with("stop_times.txt", stop_times)
+            .load()
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AdapterError::BackwardsTimes {
+                    file: "stop_times.txt",
+                    line: 4,
+                    earlier_line: 2
+                }
+            ),
+            "{error}"
+        );
     }
 
     #[test]

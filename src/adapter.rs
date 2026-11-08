@@ -43,11 +43,19 @@ pub enum AdapterError {
         line: u64,
         field: &'static str,
     },
-    #[error("{file}:{line}: at least one of {} is required, but all are empty or absent", fields.join(", "))]
-    MissingEveryField {
+    #[error(
+        "{file}:{line}: arrival_time and departure_time are both blank, \
+         but the first and last stops of a trip need a time"
+    )]
+    UntimedTripEnd { file: &'static str, line: u64 },
+    #[error(
+        "{file}:{line}: arrival_time is before the departure_time on line {earlier_line}, \
+         so the blank stops between them cannot be timed"
+    )]
+    BackwardsTimes {
         file: &'static str,
         line: u64,
-        fields: [&'static str; 2],
+        earlier_line: u64,
     },
     #[error("{file}:{line}: field {field} has invalid value {value:?}")]
     InvalidValue {
