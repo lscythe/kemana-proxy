@@ -6,7 +6,7 @@ local linters = new Mapping<String, Step> {
     ["trailing-whitespace"] = Builtins.trailing_whitespace
     ["newlines"] = Builtins.newlines
     ["taplo"] = Builtins.taplo
-    ["yamllint"] = Builtins.yamllint
+    ["ryl"] = Builtins.ryl
 }
 
 hooks {
