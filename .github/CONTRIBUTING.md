@@ -30,7 +30,7 @@ hotfix/*          →  main
 
 - Its title is `chore(release): release <version>`, which is a valid commit header, so it squashes into `develop` like any other pull request.
 - Merging it tags `v<version>` and creates the GitHub release.
-- A GitHub App token opens the pull request, so the required `rust` check runs on it. The workflow needs the repository secrets `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`.
+- A GitHub App token opens the pull request, so the required `rust` check runs on it. The workflow needs the repository secrets `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY`.
 - Do not edit the crate version or `CHANGELOG.md` by hand.
 
 ## Commit messages
