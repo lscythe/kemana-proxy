@@ -5,7 +5,7 @@ use std::str::FromStr;
 use csv::{ReaderBuilder, StringRecord};
 
 use crate::adapter::AdapterError;
-use crate::transit_model::EntityId;
+use crate::transit_model::{EntityId, ServiceDate};
 
 const BYTE_ORDER_MARK: char = '\u{feff}';
 
@@ -83,6 +83,15 @@ impl Row<'_> {
             line: self.line,
             key_fields,
             value: parts.join(", "),
+        }
+    }
+
+    pub(super) fn reversed_date_range(&self, start: ServiceDate, end: ServiceDate) -> AdapterError {
+        AdapterError::ReversedDateRange {
+            file: self.file,
+            line: self.line,
+            start,
+            end,
         }
     }
 

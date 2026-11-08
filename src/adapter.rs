@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub use gtfs::GtfsScheduleAdapter;
 
-use crate::transit_model::Dataset;
+use crate::transit_model::{Dataset, ServiceDate};
 
 pub trait OperatorAdapter {
     fn operator_id(&self) -> &str;
@@ -26,6 +26,8 @@ pub enum AdapterError {
     Archive(#[from] zip::result::ZipError),
     #[error("{file} is missing from the feed")]
     MissingFile { file: &'static str },
+    #[error("the feed needs at least one of {}, but has neither", files.join(", "))]
+    MissingEveryFile { files: [&'static str; 2] },
     #[error("{file} has no data rows")]
     EmptyFile { file: &'static str },
     #[error("{file}:{line}: {source}")]
@@ -68,6 +70,13 @@ pub enum AdapterError {
         line: u64,
         key_fields: &'static [&'static str],
         value: String,
+    },
+    #[error("{file}:{line}: start_date {start} is after end_date {end}")]
+    ReversedDateRange {
+        file: &'static str,
+        line: u64,
+        start: ServiceDate,
+        end: ServiceDate,
     },
     #[error("{file}:{line}: stop {stop_id:?} is its own ancestor through parent_station")]
     ParentCycle {

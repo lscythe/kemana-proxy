@@ -64,6 +64,50 @@ fn parse_digits(
     text.parse().map_err(|_| ServiceTimeError)
 }
 
+/// A service date held as its `YYYYMMDD` integer, which is the form the
+/// bundle stores and also sorts chronologically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServiceDate(u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("expected a real calendar date written as YYYYMMDD")]
+pub struct ServiceDateError;
+
+impl ServiceDate {
+    pub fn parse(text: &str) -> Result<Self, ServiceDateError> {
+        let value = parse_digits(text, 8..=8).map_err(|_| ServiceDateError)?;
+        let (year, month, day) = (value / 10_000, value / 100 % 100, value % 100);
+        if (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day) {
+            Ok(Self(value))
+        } else {
+            Err(ServiceDateError)
+        }
+    }
+
+    pub fn yyyymmdd(self) -> u32 {
+        self.0
+    }
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+impl fmt::Display for ServiceDate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:08}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Operator {
     pub id: String,
@@ -93,6 +137,53 @@ pub struct Route {
     pub route_type: u16,
     pub color: Option<String>,
     pub text_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Weekdays {
+    pub monday: bool,
+    pub tuesday: bool,
+    pub wednesday: bool,
+    pub thursday: bool,
+    pub friday: bool,
+    pub saturday: bool,
+    pub sunday: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateRange {
+    pub start: ServiceDate,
+    pub end: ServiceDate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    pub id: EntityId,
+    pub weekdays: Weekdays,
+    /// `None` for a service that runs only on dates its exceptions add.
+    pub date_range: Option<DateRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionType {
+    Added,
+    Removed,
+}
+
+impl ExceptionType {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Added => 1,
+            Self::Removed => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceException {
+    pub service_id: EntityId,
+    pub date: ServiceDate,
+    pub exception_type: ExceptionType,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +250,8 @@ pub struct Dataset {
     pub operator: Operator,
     pub stops: Vec<Stop>,
     pub routes: Vec<Route>,
+    pub services: Vec<Service>,
+    pub service_exceptions: Vec<ServiceException>,
     pub trips: Vec<Trip>,
     pub stop_times: Vec<StopTime>,
     pub shapes: Vec<ShapePoint>,
@@ -170,6 +263,50 @@ pub struct Dataset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_dates_keep_their_yyyymmdd_integer_and_order_chronologically() {
+        let earlier = ServiceDate::parse("20261231").unwrap();
+        let later = ServiceDate::parse("20270101").unwrap();
+
+        assert_eq!(earlier.yyyymmdd(), 20_261_231);
+        assert!(earlier < later);
+        assert_eq!(earlier.to_string(), "20261231");
+    }
+
+    #[test]
+    fn service_dates_accept_the_leap_day_only_in_leap_years() {
+        assert!(ServiceDate::parse("20240229").is_ok());
+        assert!(ServiceDate::parse("20000229").is_ok());
+        assert_eq!(ServiceDate::parse("20260229"), Err(ServiceDateError));
+        assert_eq!(ServiceDate::parse("19000229"), Err(ServiceDateError));
+    }
+
+    #[test]
+    fn service_dates_reject_anything_but_a_real_eight_digit_date() {
+        for text in [
+            "",
+            "20261301",
+            "20260230",
+            "20260431",
+            "20260001",
+            "20260100",
+            "2026011",
+            "202601011",
+            "2026-01-01",
+            "abcd1234",
+            "+2026010",
+            "٢٠٢٦٠١٠١",
+        ] {
+            assert_eq!(ServiceDate::parse(text), Err(ServiceDateError), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn exception_types_map_to_the_codes_the_bundle_stores() {
+        assert_eq!(ExceptionType::Added.code(), 1);
+        assert_eq!(ExceptionType::Removed.code(), 2);
+    }
 
     #[test]
     fn entity_ids_are_prefixed_with_the_operator_id() {
