@@ -41,6 +41,12 @@ pub enum AdapterError {
         line: u64,
         field: &'static str,
     },
+    #[error("{file}:{line}: at least one of {} is required, but all are empty or absent", fields.join(", "))]
+    MissingEveryField {
+        file: &'static str,
+        line: u64,
+        fields: [&'static str; 2],
+    },
     #[error("{file}:{line}: field {field} has invalid value {value:?}")]
     InvalidValue {
         file: &'static str,

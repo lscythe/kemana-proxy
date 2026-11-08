@@ -262,10 +262,10 @@ impl GtfsScheduleAdapter {
             (Some(arrival), Some(departure)) => (arrival, departure),
             (Some(time), None) | (None, Some(time)) => (time, time),
             (None, None) => {
-                return Err(AdapterError::MissingField {
+                return Err(AdapterError::MissingEveryField {
                     file: STOP_TIMES,
                     line: row.line(),
-                    field: "arrival_time",
+                    fields: ["arrival_time", "departure_time"],
                 });
             }
         };
@@ -286,7 +286,7 @@ impl GtfsScheduleAdapter {
             sequence: row.parse_required("shape_pt_sequence")?,
             lat: coordinate(row, "shape_pt_lat", 90.0)?,
             lon: coordinate(row, "shape_pt_lon", 180.0)?,
-            dist_traveled: row.parse_optional("shape_dist_traveled")?,
+            dist_traveled: optional_finite(row, "shape_dist_traveled")?,
         })
     }
 
@@ -307,7 +307,7 @@ impl GtfsScheduleAdapter {
     fn fare(&self, row: &Row) -> Result<Fare, AdapterError> {
         Ok(Fare {
             id: self.id(row.required("fare_id")?),
-            price: row.parse_required("price")?,
+            price: required_finite(row, "price")?,
             currency: row.required("currency_type")?.to_owned(),
             payment_method: row.parse_required("payment_method")?,
             transfers: row.parse_optional("transfers")?,
@@ -412,11 +412,27 @@ fn ids<T>(items: &[T], id: impl Fn(&T) -> &EntityId) -> HashSet<EntityId> {
 }
 
 fn coordinate(row: &Row, field: &'static str, limit: f64) -> Result<f64, AdapterError> {
-    let value: f64 = row.parse_required(field)?;
-    if value.is_finite() && value.abs() <= limit {
+    let value = required_finite(row, field)?;
+    if value.abs() <= limit {
         Ok(value)
     } else {
         Err(row.invalid(field, row.required(field)?))
+    }
+}
+
+fn required_finite(row: &Row, field: &'static str) -> Result<f64, AdapterError> {
+    let value: f64 = row.parse_required(field)?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(row.invalid(field, row.required(field)?))
+    }
+}
+
+fn optional_finite(row: &Row, field: &'static str) -> Result<Option<f64>, AdapterError> {
+    match row.optional(field) {
+        Some(_) => required_finite(row, field).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -784,14 +800,69 @@ mod tests {
         assert!(
             matches!(
                 error,
-                AdapterError::MissingField {
+                AdapterError::MissingEveryField {
                     file: "stop_times.txt",
                     line: 3,
-                    field: "arrival_time"
+                    fields: ["arrival_time", "departure_time"]
                 }
             ),
             "{error}"
         );
+        assert!(error.to_string().contains("arrival_time"), "{error}");
+        assert!(error.to_string().contains("departure_time"), "{error}");
+    }
+
+    #[test]
+    fn a_non_finite_price_is_invalid() {
+        for price in ["NaN", "inf", "-inf"] {
+            let fares = format!(
+                "fare_id,price,currency_type,payment_method,transfers\nF1,{price},USD,0,\n"
+            );
+            let error = Feed::minimal()
+                .with("fare_attributes.txt", &fares)
+                .load()
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    &error,
+                    AdapterError::InvalidValue {
+                        file: "fare_attributes.txt",
+                        line: 2,
+                        field: "price",
+                        value
+                    } if value == price
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_shape_distance_is_invalid() {
+        for distance in ["NaN", "inf"] {
+            let shapes = format!(
+                "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,shape_dist_traveled\n\
+                 SH1,1.5,103.5,0,{distance}\n"
+            );
+            let error = Feed::minimal()
+                .with("shapes.txt", &shapes)
+                .load()
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    &error,
+                    AdapterError::InvalidValue {
+                        file: "shapes.txt",
+                        line: 2,
+                        field: "shape_dist_traveled",
+                        value
+                    } if value == distance
+                ),
+                "{error}"
+            );
+        }
     }
 
     #[test]
