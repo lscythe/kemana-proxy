@@ -24,6 +24,15 @@ hotfix/*          →  main
 
 `develop` and `main` are protected: changes go through pull requests, and force pushes and deletions are blocked. Merged branches are deleted automatically.
 
+## Releases
+
+[release-please](https://github.com/googleapis/release-please) keeps a release pull request open against `develop`. It reads the Conventional Commit headers merged since the last release, picks the next version of the `kemana-proxy` crate (while the version is below 1.0, a breaking change bumps the minor version and a `feat` also bumps the minor), and updates `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md`.
+
+- Its title is `chore(release): release <version>`, which is a valid commit header, so it squashes into `develop` like any other pull request.
+- Merging it tags `v<version>` and creates the GitHub release.
+- A GitHub App token opens the pull request, so the required `rust` check runs on it. The workflow needs the repository secrets `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`.
+- Do not edit the crate version or `CHANGELOG.md` by hand.
+
 ## Commit messages
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org) and are checked by the `commit-msg` hook:
