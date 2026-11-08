@@ -6,10 +6,12 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use kemana_proxy::bundle::{BundleManifest, SCHEMA_VERSION};
 use prost::Message;
 use reqwest::StatusCode;
+use reqwest::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -51,6 +53,36 @@ impl RunningServer {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn get_if_none_match(&self, path: &str, etag: &str) -> reqwest::Response {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", self.base_url))
+            .header(IF_NONE_MATCH, etag)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Uses the `kill` utility so the test needs no signal crate.
+    #[cfg(unix)]
+    fn terminate(&mut self) -> std::process::ExitStatus {
+        let signalled = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(signalled.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "the server ignored SIGTERM");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -147,9 +179,21 @@ async fn a_client_downloads_the_bundle_built_from_a_gtfs_feed() {
 
     let response = server.get(&manifest.download_path).await;
     assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()[ETAG].to_str().unwrap().to_owned();
+    assert_eq!(etag, format!("\"{}\"", manifest.version));
+    assert_eq!(
+        response.headers()[CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
     let compressed = response.bytes().await.unwrap();
     assert_eq!(compressed.len() as u64, manifest.size_bytes);
     assert_eq!(sha256_hex(&compressed), manifest.sha256);
+
+    let revalidated = server
+        .get_if_none_match(&manifest.download_path, &etag)
+        .await;
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    assert!(revalidated.bytes().await.unwrap().is_empty());
 
     let unknown = server
         .get(&format!("/v1/bundle/{SCHEMA_VERSION}-ffffffffffffffff"))
@@ -212,6 +256,13 @@ async fn a_client_downloads_the_bundle_built_from_a_gtfs_feed() {
 
     assert_service_calendars_reached_the_bundle(&connection);
     assert_blank_stop_times_were_filled_in(&connection);
+
+    #[cfg(unix)]
+    {
+        let mut server = server;
+        let status = server.terminate();
+        assert!(status.success(), "the server exited with {status}");
+    }
 }
 
 fn assert_service_calendars_reached_the_bundle(connection: &Connection) {
