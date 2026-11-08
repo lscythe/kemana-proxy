@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -30,6 +31,9 @@ enum Command {
         /// Directory that holds the bundles and the manifest
         #[arg(long)]
         out: PathBuf,
+        /// Bundle files to retain, including the current one; older ones are deleted
+        #[arg(long, default_value = "3")]
+        keep: NonZeroUsize,
     },
     /// Serve the bundles in a directory over HTTP
     Serve {
@@ -62,7 +66,8 @@ async fn main() -> ExitCode {
             operator,
             gtfs,
             out,
-        } => build(operator, gtfs, out),
+            keep,
+        } => build(operator, gtfs, out, keep),
         Command::Serve { bundles, addr } => serve(bundles, addr).await,
     };
     match result {
@@ -74,13 +79,28 @@ async fn main() -> ExitCode {
     }
 }
 
-fn build(operator: String, gtfs: PathBuf, out: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let report = build_bundle(&GtfsScheduleAdapter::new(operator), &gtfs, &out)?;
+fn build(
+    operator: String,
+    gtfs: PathBuf,
+    out: PathBuf,
+    keep: NonZeroUsize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = build_bundle(&GtfsScheduleAdapter::new(operator), &gtfs, &out, keep)?;
     let status = match report.outcome {
         BuildOutcome::Built => "built",
         BuildOutcome::Unchanged => "unchanged",
     };
     println!("{status} {}", report.manifest.version);
+    for version in &report.pruned_versions {
+        println!("removed {version}");
+    }
+    for failure in &report.prune_failures {
+        eprintln!(
+            "warning: could not remove {}: {}",
+            failure.path.display(),
+            failure.reason
+        );
+    }
     Ok(())
 }
 
@@ -151,6 +171,7 @@ mod tests {
             operator,
             gtfs,
             out,
+            ..
         } = cli.command
         else {
             panic!("expected build-bundle");
@@ -158,6 +179,46 @@ mod tests {
         assert_eq!(operator, "demo");
         assert_eq!(gtfs, PathBuf::from("feed.zip"));
         assert_eq!(out, PathBuf::from("bundles"));
+    }
+
+    fn build_bundle_arguments(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut arguments = vec![
+            "kemana-proxy",
+            "build-bundle",
+            "--operator",
+            "demo",
+            "--gtfs",
+            "feed.zip",
+            "--out",
+            "bundles",
+        ];
+        arguments.extend_from_slice(extra);
+        Cli::try_parse_from(arguments)
+    }
+
+    fn parsed_keep(extra: &[&str]) -> usize {
+        let Command::BuildBundle { keep, .. } = build_bundle_arguments(extra).unwrap().command
+        else {
+            panic!("expected build-bundle");
+        };
+        keep.get()
+    }
+
+    #[test]
+    fn build_bundle_keeps_three_bundles_by_default() {
+        assert_eq!(parsed_keep(&[]), 3);
+    }
+
+    #[test]
+    fn build_bundle_takes_the_number_of_bundles_to_keep() {
+        assert_eq!(parsed_keep(&["--keep", "7"]), 7);
+    }
+
+    #[test]
+    fn build_bundle_rejects_keeping_no_bundles() {
+        let error = build_bundle_arguments(&["--keep", "0"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

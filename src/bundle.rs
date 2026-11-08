@@ -1,3 +1,4 @@
+mod retention;
 #[cfg(test)]
 #[path = "../build_support/schema_version.rs"]
 mod schema_version;
@@ -6,12 +7,14 @@ mod store;
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+pub use retention::PruneFailure;
 use sqlite::read_operator_id;
 pub use sqlite::{SCHEMA_SQL, write_sqlite};
 pub use store::BundleStore;
@@ -65,6 +68,8 @@ pub enum BuildOutcome {
 pub struct BuildReport {
     pub outcome: BuildOutcome,
     pub manifest: BundleManifest,
+    pub pruned_versions: Vec<String>,
+    pub prune_failures: Vec<PruneFailure>,
 }
 
 pub fn bundle_version(schema_version: u32, source_sha256: &str) -> String {
@@ -78,10 +83,14 @@ pub fn bundle_version(schema_version: u32, source_sha256: &str) -> String {
 /// it. A source whose bundle already exists is not loaded again. Files only
 /// appear under their final names once complete, so a failed build leaves
 /// the previous bundle and manifest untouched.
+///
+/// Once the manifest is written, bundle files beyond the newest `keep` are
+/// removed (see `retention::prune`).
 pub fn build_bundle(
     adapter: &dyn OperatorAdapter,
     source: &Path,
     out_dir: &Path,
+    keep: NonZeroUsize,
 ) -> Result<BuildReport, BundleError> {
     let source_sha256 = sha256_file(source)?;
     let version = bundle_version(SCHEMA_VERSION, &source_sha256);
@@ -113,7 +122,13 @@ pub fn build_bundle(
         schema_version: SCHEMA_VERSION,
     };
     write_atomically(&store.manifest_path(), &manifest.encode_to_vec())?;
-    Ok(BuildReport { outcome, manifest })
+    let pruned = retention::prune(&store, &manifest.version, keep);
+    Ok(BuildReport {
+        outcome,
+        manifest,
+        pruned_versions: pruned.removed_versions,
+        prune_failures: pruned.failures,
+    })
 }
 
 fn compress(database: &Path, out_dir: &Path) -> Result<NamedTempFile, BundleError> {
@@ -207,6 +222,20 @@ mod tests {
 
     use super::*;
     use crate::transit_model::Dataset;
+
+    const DEFAULT_KEEP: NonZeroUsize = NonZeroUsize::new(3).unwrap();
+
+    fn build_bundle(
+        adapter: &dyn OperatorAdapter,
+        source: &Path,
+        out_dir: &Path,
+    ) -> Result<BuildReport, BundleError> {
+        super::build_bundle(adapter, source, out_dir, DEFAULT_KEEP)
+    }
+
+    fn keep(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).unwrap()
+    }
 
     struct FixedAdapter(Dataset);
 
@@ -526,6 +555,252 @@ mod tests {
             "{:?}",
             workspace.out_entries()
         );
+    }
+
+    fn bundle_file(workspace: &Workspace, version: &str) -> PathBuf {
+        workspace.out().join(format!("{version}.sqlite.zst"))
+    }
+
+    fn set_modified(path: &Path, seconds_since_epoch: u64) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds_since_epoch),
+            )
+            .unwrap();
+    }
+
+    /// Builds one bundle per feed, oldest first, with modification times
+    /// 1000, 2000, ... so later feeds are newer regardless of the clock.
+    fn build_aged_bundles(workspace: &Workspace, feeds: &[&[u8]]) -> Vec<String> {
+        feeds
+            .iter()
+            .zip(1u64..)
+            .map(|(feed, rank)| {
+                let report =
+                    build_bundle(&sample_adapter(), &workspace.source(feed), &workspace.out())
+                        .unwrap();
+                set_modified(
+                    &bundle_file(workspace, &report.manifest.version),
+                    rank * 1000,
+                );
+                report.manifest.version
+            })
+            .collect()
+    }
+
+    fn bundle_files(workspace: &Workspace) -> Vec<String> {
+        workspace
+            .out_entries()
+            .into_iter()
+            .filter(|name| name.ends_with(".sqlite.zst"))
+            .collect()
+    }
+
+    fn file_names(versions: &[&String]) -> Vec<String> {
+        let mut names: Vec<String> = versions
+            .iter()
+            .map(|version| format!("{version}.sqlite.zst"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_build_keeps_the_newest_bundles_and_removes_older_ones() {
+        let workspace = Workspace::new();
+        let versions = build_aged_bundles(&workspace, &[b"feed a", b"feed b", b"feed c"]);
+
+        let report = super::build_bundle(
+            &sample_adapter(),
+            &workspace.source(b"feed d"),
+            &workspace.out(),
+            keep(2),
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, BuildOutcome::Built);
+        assert_eq!(
+            report.pruned_versions,
+            [versions[0].clone(), versions[1].clone()]
+        );
+        assert!(report.prune_failures.is_empty());
+        assert_eq!(
+            bundle_files(&workspace),
+            file_names(&[&versions[2], &report.manifest.version])
+        );
+    }
+
+    #[test]
+    fn the_manifest_version_survives_when_it_is_the_oldest_bundle() {
+        let workspace = Workspace::new();
+        let versions = build_aged_bundles(&workspace, &[b"feed a", b"feed b", b"feed c"]);
+
+        let report = super::build_bundle(
+            &FailingAdapter,
+            &workspace.source(b"feed a"),
+            &workspace.out(),
+            keep(2),
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, BuildOutcome::Unchanged);
+        assert_eq!(report.manifest.version, versions[0]);
+        assert_eq!(report.pruned_versions, [versions[1].clone()]);
+        assert_eq!(
+            bundle_files(&workspace),
+            file_names(&[&versions[0], &versions[2]])
+        );
+        let stored = std::fs::read(workspace.out().join("manifest.pb")).unwrap();
+        assert_eq!(
+            BundleManifest::decode(stored.as_slice()).unwrap().version,
+            versions[0]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_build_prunes_and_a_lower_keep_takes_effect() {
+        let workspace = Workspace::new();
+        let versions = build_aged_bundles(&workspace, &[b"feed a", b"feed b", b"feed c"]);
+
+        let report = super::build_bundle(
+            &FailingAdapter,
+            &workspace.source(b"feed c"),
+            &workspace.out(),
+            keep(1),
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, BuildOutcome::Unchanged);
+        assert_eq!(
+            report.pruned_versions,
+            [versions[0].clone(), versions[1].clone()]
+        );
+        assert_eq!(bundle_files(&workspace), file_names(&[&versions[2]]));
+    }
+
+    #[test]
+    fn a_failed_build_deletes_nothing() {
+        let workspace = Workspace::new();
+        build_aged_bundles(&workspace, &[b"feed a", b"feed b", b"feed c"]);
+        let before = workspace.out_contents();
+
+        let error = super::build_bundle(
+            &FailingAdapter,
+            &workspace.source(b"feed d"),
+            &workspace.out(),
+            keep(1),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, BundleError::Adapter(_)), "{error}");
+        assert_eq!(workspace.out_contents(), before);
+    }
+
+    #[test]
+    fn fewer_bundles_than_keep_removes_nothing() {
+        let workspace = Workspace::new();
+        build_aged_bundles(&workspace, &[b"feed a"]);
+
+        let report = super::build_bundle(
+            &sample_adapter(),
+            &workspace.source(b"feed b"),
+            &workspace.out(),
+            keep(5),
+        )
+        .unwrap();
+
+        assert!(report.pruned_versions.is_empty());
+        assert_eq!(bundle_files(&workspace).len(), 2);
+    }
+
+    #[test]
+    fn only_correctly_named_bundle_files_are_candidates() {
+        let workspace = Workspace::new();
+        let versions = build_aged_bundles(&workspace, &[b"feed a"]);
+        let out = workspace.out();
+        let bystanders = [
+            "notes.txt",
+            "badly-named.sqlite.zst",
+            "1-FEDCBA9876543210.sqlite.zst",
+            "1-0123456789abcdef.sqlite.zst.bak",
+            ".tmpAbC123",
+        ];
+        for name in bystanders {
+            std::fs::write(out.join(name), b"keep me").unwrap();
+            set_modified(&out.join(name), 1);
+        }
+        let lookalike_directory = out.join("1-0123456789abcdef.sqlite.zst");
+        std::fs::create_dir(&lookalike_directory).unwrap();
+        std::fs::write(lookalike_directory.join("inner"), b"keep me").unwrap();
+
+        let report = super::build_bundle(
+            &sample_adapter(),
+            &workspace.source(b"feed b"),
+            &out,
+            keep(1),
+        )
+        .unwrap();
+
+        assert_eq!(report.pruned_versions, [versions[0].clone()]);
+        let mut expected: Vec<String> = bystanders.iter().map(|name| (*name).to_owned()).collect();
+        expected.push("1-0123456789abcdef.sqlite.zst".to_owned());
+        expected.push("manifest.pb".to_owned());
+        expected.push(format!("{}.sqlite.zst", report.manifest.version));
+        expected.sort();
+        assert_eq!(workspace.out_entries(), expected);
+        assert!(lookalike_directory.join("inner").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_like_a_bundle_is_left_alone() {
+        let workspace = Workspace::new();
+        build_aged_bundles(&workspace, &[b"feed a"]);
+        let target = workspace.dir.path().join("elsewhere.sqlite.zst");
+        std::fs::write(&target, b"outside the store").unwrap();
+        let link = workspace.out().join("1-0123456789abcdef.sqlite.zst");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        super::build_bundle(
+            &sample_adapter(),
+            &workspace.source(b"feed b"),
+            &workspace.out(),
+            keep(1),
+        )
+        .unwrap();
+
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside the store");
+    }
+
+    #[test]
+    fn bundles_with_the_same_modification_time_are_ordered_by_version() {
+        let workspace = Workspace::new();
+        let out = workspace.out();
+        std::fs::create_dir_all(&out).unwrap();
+        let tied = [
+            "1-00000000000000a1",
+            "1-00000000000000a3",
+            "1-00000000000000a2",
+        ];
+        for version in tied {
+            let path = out.join(format!("{version}.sqlite.zst"));
+            std::fs::write(&path, b"bundle").unwrap();
+            set_modified(&path, 5000);
+        }
+
+        let report =
+            super::build_bundle(&sample_adapter(), &workspace.source(b"feed"), &out, keep(2))
+                .unwrap();
+
+        assert_eq!(
+            report.pruned_versions,
+            ["1-00000000000000a1", "1-00000000000000a2"]
+        );
+        assert!(out.join("1-00000000000000a3.sqlite.zst").exists());
     }
 
     #[test]
