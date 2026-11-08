@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use kemana_proxy::adapter::GtfsScheduleAdapter;
 use kemana_proxy::bundle::{BuildOutcome, BundleStore, build_bundle};
-use kemana_proxy::http::router;
+use kemana_proxy::http::{SHUTDOWN_DRAIN_LIMIT, router, serve as serve_http};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,17 +86,41 @@ fn build(operator: String, gtfs: PathBuf, out: PathBuf) -> Result<(), Box<dyn st
 
 async fn serve(bundles: PathBuf, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let shutdown = shutdown_signal()?;
     println!(
         "serving {} on http://{}",
         bundles.display(),
         listener.local_addr()?
     );
-    axum::serve(listener, router(BundleStore::new(bundles)))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    serve_http(
+        listener,
+        router(BundleStore::new(bundles)),
+        shutdown,
+        SHUTDOWN_DRAIN_LIMIT,
+    )
+    .await?;
     Ok(())
+}
+
+/// Resolves on ctrl-c, or on SIGTERM where the platform has it. The SIGTERM
+/// handler is installed before this returns, so a SIGTERM sent right after the
+/// startup banner is never lost.
+fn shutdown_signal() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    Ok(async move {
+        #[cfg(unix)]
+        let terminated = async {
+            terminate.recv().await;
+        };
+        #[cfg(not(unix))]
+        let terminated = std::future::pending::<()>();
+        tokio::select! {
+            _ = &mut interrupt => {}
+            () = terminated => {}
+        }
+    })
 }
 
 #[cfg(test)]

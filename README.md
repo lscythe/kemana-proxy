@@ -24,6 +24,17 @@ One output directory serves one operator: building a feed whose bundle already e
 | `GET /v1/bundle/manifest` | `kemana.bundle.v1.BundleManifest` as protobuf; `sha256` and `size_bytes` describe the compressed download |
 | `GET /v1/bundle/{version}` | The zstd-compressed SQLite bundle, or 404 for an unknown version |
 
+Bundles are streamed from disk with a `Content-Length`. `HEAD` returns the same headers without a body.
+
+| Route | `Cache-Control` | `ETag` |
+| --- | --- | --- |
+| Manifest | `no-cache` | sha256 of the manifest bytes, quoted |
+| Bundle | `public, max-age=31536000, immutable` | the version, quoted |
+
+A bundle's bytes never change for a version, so clients can keep it forever and only revalidate the manifest. Both routes answer a matching `If-None-Match` (a list, `*`, or a `W/` tag) with `304 Not Modified` and no body. A missing file is still 404, even with `If-None-Match`.
+
+`serve` stops on ctrl-c or SIGTERM. Requests in flight get up to 30 seconds to finish, then the process exits regardless, so a slow client cannot block a deploy.
+
 ## Requirements
 
 - [mise](https://mise.jdx.dev), which installs the Rust toolchain, Python, hk and the other tools at the versions pinned in `mise.toml`, runs the tasks and enables the git hooks
