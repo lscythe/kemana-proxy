@@ -6,14 +6,12 @@ The repository currently holds the project skeleton and tooling only.
 
 ## Requirements
 
-- Rust 1.99.0 (installed automatically by `rustup` from `rust-toolchain.toml`)
-- [mise](https://mise.jdx.dev) for the task runner, Python and git hooks
+- [mise](https://mise.jdx.dev), which installs the Rust toolchain, Python, hk and the other tools at the versions pinned in `mise.toml`, runs the tasks and enables the git hooks
 
 ## Development
 
 ```sh
-mise install        # install the pinned tools
-hk install --mise   # enable the git hooks
+mise install        # install the pinned tools and enable the git hooks
 
 mise run format     # format sources
 mise run check      # rustfmt check and clippy with warnings denied
