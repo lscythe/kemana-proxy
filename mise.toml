@@ -1,0 +1,30 @@
+[tools]
+hk = "2.9.0"
+python = "3.15.2"
+"github:taiki-e/cargo-llvm-cov" = "latest"
+
+[tasks.format]
+description = "Format sources with rustfmt"
+run = "cargo fmt"
+
+[tasks.check]
+description = "Run the static checks"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+]
+
+[tasks.test]
+description = "Run the script and Rust tests"
+run = [
+  "python3 -m unittest discover -s .github/scripts -p 'test_*.py'",
+  "cargo test",
+]
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.coverage]
+description = "Write an LCOV coverage report"
+run = "cargo llvm-cov --lcov --output-path lcov.info"

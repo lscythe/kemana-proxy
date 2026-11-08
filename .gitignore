@@ -1,0 +1,10 @@
+target/
+lcov.info
+__pycache__/
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.swp
